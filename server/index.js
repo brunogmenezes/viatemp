@@ -5,6 +5,8 @@ const mqtt = require('mqtt');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const https = require('https');
+const net = require('net');
 
 const app = express();
 app.use(cors());
@@ -30,6 +32,26 @@ const MQTT_USER = process.env.MQTT_USER;
 const MQTT_PASS = process.env.MQTT_PASS;
 const HEARTBEAT_TTL_MS = parseInt(process.env.HEARTBEAT_TTL_MS || '120000', 10);
 const FIRMWARE_BASE_URL = process.env.FIRMWARE_BASE_URL || '';
+const ZABBIX_ITEM_KEYS = {
+  uptime: 'viatemp.uptime',
+  version: 'viatemp.version',
+  temperature: 'viatemp.temperature'
+};
+
+const ZABBIX_CONFIG_FILE = path.join(__dirname, 'zabbix.json');
+const zabbixConfig = {
+  enabled: process.env.ZABBIX_ENABLED === '1',
+  apiUrl: process.env.ZABBIX_API_URL || '',
+  apiToken: process.env.ZABBIX_API_TOKEN || '',
+  hostGroup: process.env.ZABBIX_HOST_GROUP || 'VIATEMP',
+  templateName: process.env.ZABBIX_TEMPLATE || 'VIATEMP',
+  authUser: process.env.ZABBIX_USER || '',
+  authPass: process.env.ZABBIX_PASS || '',
+  senderHost: process.env.ZABBIX_SENDER_HOST || '',
+  senderPort: parseInt(process.env.ZABBIX_SENDER_PORT || '10051', 10)
+};
+let zabbixSession = { token: '', expiresAt: 0 };
+let zabbixHistoryPushUnsupported = false;
 
 // In-memory device registry: mac -> device
 const devices = {};
@@ -63,6 +85,358 @@ function saveFirmwareIndex() {
   } catch (e) {
     console.warn('Failed to save firmware index', e.message);
   }
+}
+
+function loadZabbixConfig() {
+  if (!fs.existsSync(ZABBIX_CONFIG_FILE)) return;
+  try {
+    const raw = fs.readFileSync(ZABBIX_CONFIG_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (typeof data.enabled === 'boolean') zabbixConfig.enabled = data.enabled;
+    if (typeof data.apiUrl === 'string' && data.apiUrl.trim().length) zabbixConfig.apiUrl = data.apiUrl.trim();
+    if (typeof data.hostGroup === 'string' && data.hostGroup.trim().length) zabbixConfig.hostGroup = data.hostGroup.trim();
+  } catch (e) {
+    console.warn('Failed to load Zabbix config', e.message);
+  }
+}
+
+function saveZabbixConfig() {
+  const payload = {
+    enabled: !!zabbixConfig.enabled,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup
+  };
+  try {
+    fs.writeFileSync(ZABBIX_CONFIG_FILE, JSON.stringify(payload, null, 2));
+  } catch (e) {
+    console.warn('Failed to save Zabbix config', e.message);
+  }
+}
+
+function getZabbixPublicConfig() {
+  return {
+    enabled: !!zabbixConfig.enabled,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup,
+    tokenConfigured: !!zabbixConfig.apiToken
+  };
+}
+
+function isZabbixEnabled() {
+  const hasToken = !!zabbixConfig.apiToken;
+  const hasUserPass = !!(zabbixConfig.authUser && zabbixConfig.authPass);
+  return !!(zabbixConfig.enabled && zabbixConfig.apiUrl && (hasToken || hasUserPass));
+}
+
+function zabbixHttpRequest(payload, headers) {
+  return new Promise((resolve, reject) => {
+    const apiUrl = new URL(zabbixConfig.apiUrl);
+    const options = {
+      method: 'POST',
+      hostname: apiUrl.hostname,
+      port: apiUrl.port || (apiUrl.protocol === 'https:' ? 443 : 80),
+      path: apiUrl.pathname + apiUrl.search,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        ...headers
+      }
+    };
+    const client = apiUrl.protocol === 'https:' ? https : http;
+    const req = client.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body || '{}');
+          if (json.error) {
+            const err = new Error(json.error.message || 'zabbix_error');
+            err.code = json.error.code;
+            err.data = json.error.data;
+            err.method = json.error.data && json.error.data.method ? json.error.data.method : undefined;
+            return reject(err);
+          }
+          resolve(json.result);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function getZabbixSenderHost() {
+  if (zabbixConfig.senderHost) return zabbixConfig.senderHost;
+  if (zabbixConfig.apiUrl) {
+    try {
+      const apiUrl = new URL(zabbixConfig.apiUrl);
+      return apiUrl.hostname;
+    } catch (e) {
+      return '';
+    }
+  }
+  return '';
+}
+
+function zabbixSenderRequest(data) {
+  const host = getZabbixSenderHost();
+  const port = Number.isFinite(zabbixConfig.senderPort) ? zabbixConfig.senderPort : 10051;
+  if (!host) return Promise.reject(new Error('zabbix_sender_host_missing'));
+
+  const now = Date.now();
+  const clock = Math.floor(now / 1000);
+  const keys = Array.isArray(data) ? data.map(d => d.key).filter(Boolean) : [];
+  console.log('Zabbix sender payload', { host, port, clock, keys, count: Array.isArray(data) ? data.length : 0 });
+
+  const payloadObj = {
+    request: 'sender data',
+    data,
+    clock
+  };
+  const payload = JSON.stringify(payloadObj);
+  const header = Buffer.from('ZBXD\x01');
+  const length = Buffer.alloc(8);
+  length.writeUInt32LE(Buffer.byteLength(payload), 0);
+  length.writeUInt32LE(0, 4);
+  const packet = Buffer.concat([header, length, Buffer.from(payload)]);
+
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('zabbix_sender_timeout'));
+    }, 6000);
+
+    const chunks = [];
+    socket.on('data', (chunk) => { chunks.push(chunk); });
+    socket.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      const buf = Buffer.concat(chunks);
+      if (buf.length < 13) return resolve(null);
+      const jsonStart = 13;
+      const jsonStr = buf.slice(jsonStart).toString('utf8');
+      try {
+        const json = JSON.parse(jsonStr);
+        if (json.response && json.response !== 'success') {
+          const err = new Error('zabbix_sender_failed');
+          err.info = json.info;
+          return reject(err);
+        }
+        resolve(json);
+      } catch (e) {
+        resolve(null);
+      }
+    });
+
+    socket.connect(port, host, () => {
+      socket.write(packet);
+    });
+  });
+}
+
+async function zabbixLogin() {
+  const payload = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'user.login',
+    params: {
+      user: zabbixConfig.authUser,
+      password: zabbixConfig.authPass
+    },
+    id: Date.now()
+  });
+  const token = await zabbixHttpRequest(payload, {});
+  if (typeof token === 'string' && token.length) {
+    zabbixSession = { token, expiresAt: Date.now() + (10 * 60 * 1000) };
+    return token;
+  }
+  throw new Error('zabbix_login_failed');
+}
+
+async function getZabbixAuth() {
+  if (zabbixConfig.apiToken) return { useBearer: true, token: zabbixConfig.apiToken };
+  if (!(zabbixConfig.authUser && zabbixConfig.authPass)) return { useBearer: false, token: '' };
+  if (zabbixSession.token && zabbixSession.expiresAt > Date.now()) {
+    return { useBearer: false, token: zabbixSession.token };
+  }
+  const token = await zabbixLogin();
+  return { useBearer: false, token };
+}
+
+async function zabbixRequest(method, params) {
+  if (!isZabbixEnabled()) return null;
+  const auth = await getZabbixAuth();
+  const payloadObj = {
+    jsonrpc: '2.0',
+    method,
+    params,
+    id: Date.now()
+  };
+  if (!auth.useBearer && auth.token) payloadObj.auth = auth.token;
+  const payload = JSON.stringify(payloadObj);
+  const headers = auth.useBearer && auth.token ? { Authorization: `Bearer ${auth.token}` } : {};
+
+  try {
+    return await zabbixHttpRequest(payload, headers);
+  } catch (e) {
+    const shouldRetry = !auth.useBearer && e && e.message === 'Not authorized.';
+    if (shouldRetry && zabbixConfig.authUser && zabbixConfig.authPass) {
+      zabbixSession = { token: '', expiresAt: 0 };
+      const refreshed = await getZabbixAuth();
+      if (!refreshed.useBearer && refreshed.token) payloadObj.auth = refreshed.token;
+      const retryPayload = JSON.stringify(payloadObj);
+      const retryHeaders = refreshed.useBearer && refreshed.token ? { Authorization: `Bearer ${refreshed.token}` } : {};
+      return await zabbixHttpRequest(retryPayload, retryHeaders);
+    }
+    e.method = method;
+    throw e;
+  }
+}
+
+async function ensureZabbixHostAndItems(device) {
+  if (!isZabbixEnabled() || !device || !device.name) return null;
+  if (device.zabbixEnsuring) return null;
+  device.zabbixEnsuring = true;
+  try {
+    const macSuffix = (device.mac || '').replace(/:/g, '').toLowerCase();
+    const hostName = macSuffix ? `${device.name}-${macSuffix}` : device.name;
+    const groupResult = await zabbixRequest('hostgroup.get', {
+      output: ['groupid', 'name'],
+      filter: { name: [zabbixConfig.hostGroup] }
+    });
+    let groupId = groupResult && groupResult.length ? groupResult[0].groupid : null;
+    if (!groupId) {
+      const created = await zabbixRequest('hostgroup.create', { name: zabbixConfig.hostGroup });
+      groupId = created && created.groupids ? created.groupids[0] : null;
+    }
+    if (!groupId) throw new Error('zabbix_group_failed');
+
+    const templateResult = await zabbixRequest('template.get', {
+      output: ['templateid', 'host'],
+      filter: { host: [zabbixConfig.templateName] }
+    });
+    const templateId = templateResult && templateResult.length ? templateResult[0].templateid : null;
+    if (!templateId) throw new Error('zabbix_template_missing');
+
+    const hostResult = await zabbixRequest('host.get', {
+      output: ['hostid', 'host'],
+      selectParentTemplates: ['templateid', 'name'],
+      selectInterfaces: ['interfaceid', 'ip', 'useip', 'dns', 'port'],
+      filter: { host: [hostName] }
+    });
+    let hostId = hostResult && hostResult.length ? hostResult[0].hostid : null;
+    const parentTemplates = hostResult && hostResult.length ? hostResult[0].parentTemplates || [] : [];
+    const interfaces = hostResult && hostResult.length ? hostResult[0].interfaces || [] : [];
+    const hasTemplate = parentTemplates.some((tpl) => tpl.templateid === templateId);
+    if (!hostId) {
+      const ip = device.ip || '127.0.0.1';
+      const createdHost = await zabbixRequest('host.create', {
+        host: hostName,
+        groups: [{ groupid: groupId }],
+        templates: [{ templateid: templateId }],
+        interfaces: [{ type: 1, main: 1, useip: 1, ip, dns: '', port: '10050' }]
+      });
+      hostId = createdHost && createdHost.hostids ? createdHost.hostids[0] : null;
+    } else if (!hasTemplate) {
+      const templates = parentTemplates.map((tpl) => ({ templateid: tpl.templateid }));
+      templates.push({ templateid: templateId });
+      await zabbixRequest('host.update', { hostid: hostId, templates });
+    }
+
+    if (hostId && device.ip && interfaces.length) {
+      const mainInterface = interfaces.find((iface) => iface.useip === '1' || iface.useip === 1) || interfaces[0];
+      if (mainInterface && mainInterface.ip && mainInterface.ip !== device.ip) {
+        await zabbixRequest('hostinterface.update', {
+          interfaceid: mainInterface.interfaceid,
+          ip: device.ip,
+          useip: 1,
+          dns: ''
+        });
+      }
+    }
+    if (!hostId) throw new Error('zabbix_host_failed');
+
+    device.zabbix = {
+      hostid: hostId,
+      host: hostName,
+      templateid: templateId
+    };
+    device.zabbixEnsured = true;
+    scheduleSaveDevices();
+    return device.zabbix;
+  } finally {
+    device.zabbixEnsuring = false;
+  }
+}
+
+async function pushZabbixValues(device, values) {
+  if (!isZabbixEnabled() || !device || !device.zabbix) return;
+  const entries = [];
+  const clock = Math.floor(Date.now() / 1000);
+  const useSender = zabbixHistoryPushUnsupported || !device.zabbix.items;
+  if (useSender) {
+    const senderEntries = [];
+    const host = (device.zabbix && device.zabbix.host) || device.name || device.mac;
+    if (values.uptime !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.uptime, value: Number(values.uptime), clock });
+    if (values.version !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.version, value: String(values.version), clock });
+    if (values.temperature !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.temperature, value: Number(values.temperature), clock });
+    if (senderEntries.length) await zabbixSenderRequest(senderEntries);
+    return;
+  }
+
+  if (values.uptime !== undefined && device.zabbix.items.uptime) {
+    entries.push({ itemid: device.zabbix.items.uptime, value: Number(values.uptime), clock });
+  }
+  if (values.version !== undefined && device.zabbix.items.version) {
+    entries.push({ itemid: device.zabbix.items.version, value: String(values.version), clock });
+  }
+  if (values.temperature !== undefined && device.zabbix.items.temperature) {
+    entries.push({ itemid: device.zabbix.items.temperature, value: Number(values.temperature), clock });
+  }
+  if (!entries.length) return;
+
+  try {
+    await zabbixRequest('history.push', entries);
+  } catch (e) {
+    if (e && e.message === 'Invalid params.') {
+      await zabbixRequest('history.push', { data: entries });
+      return;
+    }
+    if (e && e.message === 'Method not found.') {
+      zabbixHistoryPushUnsupported = true;
+      const senderEntries = [];
+      const host = (device.zabbix && device.zabbix.host) || device.name || device.mac;
+      if (values.uptime !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.uptime, value: Number(values.uptime), clock });
+      if (values.version !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.version, value: String(values.version), clock });
+      if (values.temperature !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.temperature, value: Number(values.temperature), clock });
+      if (senderEntries.length) await zabbixSenderRequest(senderEntries);
+      return;
+    }
+    throw e;
+  }
+}
+
+function queueZabbixUpdate(device, values) {
+  if (!device || !device.adopted) return;
+  if (!isZabbixEnabled()) return;
+  setImmediate(async () => {
+    try {
+      if (!device.zabbixEnsured) await ensureZabbixHostAndItems(device);
+      await pushZabbixValues(device, values);
+    } catch (e) {
+      const info = [];
+      if (e && e.method) info.push(`method=${e.method}`);
+      if (e && e.code !== undefined) info.push(`code=${e.code}`);
+      if (e && e.data) info.push(`data=${e.data}`);
+      console.warn('Zabbix update failed', e && e.message ? e.message : 'unknown_error', info.join(' '));
+    }
+  });
 }
 
 function sanitizeVersion(value) {
@@ -99,6 +473,7 @@ function getLatestFirmware() {
 
 ensureFirmwareDir();
 loadFirmwareIndex();
+loadZabbixConfig();
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, FIRMWARE_DIR),
@@ -222,6 +597,10 @@ mqttClient.on('message', (topic, payload) => {
       devices[key].adopted = devices[key].adopted || false;
       scheduleSaveDevices();
       io.emit('devices_updated', getDeviceList());
+      queueZabbixUpdate(devices[key], {
+        uptime: devices[key].uptime,
+        version: devices[key].version
+      });
     }
     if (topic === 'esp32/temperature') {
       const mac = msg.mac;
@@ -243,6 +622,11 @@ mqttClient.on('message', (topic, payload) => {
       devices[key].adopted = devices[key].adopted || false;
       scheduleSaveDevices();
       io.emit('devices_updated', getDeviceList());
+      queueZabbixUpdate(devices[key], {
+        temperature: devices[key].temperature,
+        uptime: devices[key].uptime,
+        version: devices[key].version
+      });
     }
   } catch (e) {
     console.warn('Invalid MQTT payload', e.message);
@@ -286,6 +670,136 @@ app.post('/api/firmware/upload', verifyTokenMiddleware, (req, res) => {
   });
 });
 
+// Zabbix config APIs
+app.get('/api/zabbix/config', verifyTokenMiddleware, (req, res) => {
+  res.json(getZabbixPublicConfig());
+});
+
+app.post('/api/zabbix/config', verifyTokenMiddleware, (req, res) => {
+  const body = req.body || {};
+  if (typeof body.enabled === 'boolean') zabbixConfig.enabled = body.enabled;
+  if (typeof body.apiUrl === 'string' && body.apiUrl.trim().length) zabbixConfig.apiUrl = body.apiUrl.trim();
+  if (typeof body.hostGroup === 'string' && body.hostGroup.trim().length) zabbixConfig.hostGroup = body.hostGroup.trim();
+  saveZabbixConfig();
+  res.json(getZabbixPublicConfig());
+});
+
+app.get('/api/zabbix/diagnose', verifyTokenMiddleware, async (req, res) => {
+  if (!isZabbixEnabled()) return res.status(400).json({ error: 'zabbix_disabled' });
+
+  const result = {
+    ok: false,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup,
+    checks: {}
+  };
+
+  try {
+    result.checks.apiVersion = await zabbixRequest('apiinfo.version', {});
+  } catch (e) {
+    result.checks.apiVersion = { error: e.message || 'failed', code: e.code, data: e.data };
+    return res.status(500).json(result);
+  }
+
+  try {
+    const groups = await zabbixRequest('hostgroup.get', {
+      output: ['groupid', 'name'],
+      filter: { name: [zabbixConfig.hostGroup] }
+    });
+    result.checks.hostGroup = groups;
+    result.ok = true;
+    return res.json(result);
+  } catch (e) {
+    result.checks.hostGroup = { error: e.message || 'failed', code: e.code, data: e.data };
+    return res.status(500).json(result);
+  }
+});
+
+app.get('/api/zabbix/diagnose-public', async (req, res) => {
+  if (!isZabbixEnabled()) return res.status(400).json({ error: 'zabbix_disabled' });
+
+  const result = {
+    ok: false,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup,
+    checks: {}
+  };
+
+  try {
+    result.checks.apiVersion = await zabbixRequest('apiinfo.version', {});
+  } catch (e) {
+    result.checks.apiVersion = { error: e.message || 'failed', code: e.code, data: e.data };
+    return res.status(500).json(result);
+  }
+
+  try {
+    const groups = await zabbixRequest('hostgroup.get', {
+      output: ['groupid', 'name'],
+      filter: { name: [zabbixConfig.hostGroup] }
+    });
+    result.checks.hostGroup = groups;
+    result.ok = true;
+    return res.json(result);
+  } catch (e) {
+    result.checks.hostGroup = { error: e.message || 'failed', code: e.code, data: e.data };
+    return res.status(500).json(result);
+  }
+});
+
+app.get('/api/zabbix/auth-status', verifyTokenMiddleware, (req, res) => {
+  const hasToken = !!zabbixConfig.apiToken;
+  const hasUserPass = !!(zabbixConfig.authUser && zabbixConfig.authPass);
+  const authMode = hasToken ? 'token' : (hasUserPass ? 'userpass' : 'none');
+  res.json({
+    enabled: !!zabbixConfig.enabled,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup,
+    authMode,
+    hasToken,
+    hasUserPass,
+    sessionActive: !!(zabbixSession.token && zabbixSession.expiresAt > Date.now())
+  });
+});
+
+app.get('/api/zabbix/auth-status-public', (req, res) => {
+  const hasToken = !!zabbixConfig.apiToken;
+  const hasUserPass = !!(zabbixConfig.authUser && zabbixConfig.authPass);
+  const authMode = hasToken ? 'token' : (hasUserPass ? 'userpass' : 'none');
+  res.json({
+    enabled: !!zabbixConfig.enabled,
+    apiUrl: zabbixConfig.apiUrl,
+    hostGroup: zabbixConfig.hostGroup,
+    authMode,
+    hasToken,
+    hasUserPass,
+    sessionActive: !!(zabbixSession.token && zabbixSession.expiresAt > Date.now())
+  });
+});
+
+app.post('/api/devices/:mac/zabbix/sync', verifyTokenMiddleware, async (req, res) => {
+  const mac = req.params.mac.replace(/:/g, '').toLowerCase();
+  const device = devices[mac];
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  if (!isZabbixEnabled()) return res.status(400).json({ error: 'zabbix_disabled' });
+
+  try {
+    await ensureZabbixHostAndItems(device);
+    await pushZabbixValues(device, {
+      uptime: device.uptime,
+      version: device.version,
+      temperature: device.temperature
+    });
+    res.json({ ok: true, zabbix: device.zabbix || null });
+  } catch (e) {
+    const info = [];
+    if (e && e.method) info.push(`method=${e.method}`);
+    if (e && e.code !== undefined) info.push(`code=${e.code}`);
+    if (e && e.data) info.push(`data=${e.data}`);
+    console.warn('Zabbix sync failed', e && e.message ? e.message : 'unknown_error', info.join(' '));
+    res.status(500).json({ error: 'zabbix_sync_failed' });
+  }
+});
+
 // API
 app.get('/api/devices', (req, res) => {
   res.json(getDeviceList());
@@ -324,6 +838,14 @@ app.post('/api/devices/:mac/adopt', verifyTokenMiddleware, async (req, res) => {
   device.adopted = true;
   scheduleSaveDevices();
 
+  if (isZabbixEnabled()) {
+    try {
+      await ensureZabbixHostAndItems(device);
+    } catch (e) {
+      console.warn('Zabbix ensure failed on adopt', e.message);
+    }
+  }
+
   // Publish config to device
   const cfgTopic = `devices/${mac}/config`;
   const payloadObj = { name: device.name };
@@ -351,6 +873,28 @@ app.delete('/api/devices/:mac', verifyTokenMiddleware, (req, res) => {
   device.location = '';
   device.location_id = null;
   scheduleSaveDevices();
+
+  if (isZabbixEnabled()) {
+    setImmediate(async () => {
+      try {
+        let hostId = device.zabbix && device.zabbix.hostid ? device.zabbix.hostid : null;
+        if (!hostId && device.zabbix && device.zabbix.host) {
+          const hostResult = await zabbixRequest('host.get', {
+            output: ['hostid', 'host'],
+            filter: { host: [device.zabbix.host] }
+          });
+          if (hostResult && hostResult.length) hostId = hostResult[0].hostid;
+        }
+        if (hostId) await zabbixRequest('host.delete', [hostId]);
+      } catch (e) {
+        const info = [];
+        if (e && e.method) info.push(`method=${e.method}`);
+        if (e && e.code !== undefined) info.push(`code=${e.code}`);
+        if (e && e.data) info.push(`data=${e.data}`);
+        console.warn('Zabbix delete failed', e && e.message ? e.message : 'unknown_error', info.join(' '));
+      }
+    });
+  }
 
   // Inform device that it was unadopted
   const cfgTopic = `devices/${mac}/config`;

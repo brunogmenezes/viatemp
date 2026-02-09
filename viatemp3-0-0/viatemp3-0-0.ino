@@ -1,5 +1,3 @@
-#include <dummy.h>
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <EEPROM.h>
@@ -8,31 +6,18 @@
 #include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <esp_task_wdt.h>
-#include <esp_err.h>
-#include <ArduinoJson.h>
-#include <ctype.h>
 
 // Versão do firmware
-#define FIRMWARE_VERSION "3.0.0"
-
-// Watchdog timeout em segundos
-#define WDT_TIMEOUT 60
-// Disable WDT if the device keeps rebooting
-#define ENABLE_WDT 0
+#define FIRMWARE_VERSION "3.0.1"
 
 // Definições para DS18B20
 #define ONE_WIRE_BUS 4
-#define TEMPERATURE_PRECISION 4
+#define TEMPERATURE_PRECISION 12
 
 // Intervalo de leitura de temperatura em milissegundos
 #define TEMP_READ_INTERVAL 300000  // 5 minutos
 // Intervalo do heartbeat em milissegundos
 #define HEARTBEAT_INTERVAL 60000  // 1 minuto
-// Reiniciar se ficar sem comunicacao MQTT por muito tempo (em ms)
-#define MQTT_NO_COMM_TIMEOUT_MS 1800000  // 30 minutos
-// Duracao da sessao web (em ms)
-#define SESSION_TTL_MS 43200000  // 12 horas
 
 // Estruturas para configuração
 struct SensorConfig {
@@ -74,11 +59,8 @@ WiFiConfig wifiConfig;
 MQTTConfig mqttConfig;
 bool shouldReboot = false;
 bool isAPMode = false;
-unsigned long lastMqttActivity = 0;
-bool mqttEverConnected = false;
-String sessionToken = "";
-unsigned long sessionExpiresAt = 0;
-String pendingOtaUrl = "";
+int mqttFailCount = 0;
+unsigned long lastHeartbeat = 0;
 
 // Endereços EEPROM
 #define EEPROM_SIZE 1024
@@ -104,37 +86,16 @@ void connectWiFi();
 void setupAPMode();
 void connectMQTT();
 void readAndSendTemperature();
+void sendHeartbeat();
 bool isAuthenticated();
 void setupWebServer();
-bool isPrintableAscii(const char* value, size_t maxLen, bool allowEmpty);
-void disableTaskWDT();
-String htmlEscape(const String& input);
-String getCookieValue(const String& cookieHeader, const String& name);
-bool hasValidSession();
-void createSession();
-void clearSession();
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-
-    disableTaskWDT();
-
-  Serial.println("\n=== Iniciando Sistema ESP32 Temperature ===");
-
-  Serial.println("\n=== INICIANDO SISTEMA ===");
   
-    // Configurar Watchdog Timer
-    #if ENABLE_WDT
-    Serial.println("Configurando Watchdog Timer (" + String(WDT_TIMEOUT) + "s)...");
-    esp_task_wdt_config_t wdtConfig = {
-        .timeout_ms = WDT_TIMEOUT * 1000,
-        .idle_core_mask = 0,
-        .trigger_panic = false
-    };
-    esp_task_wdt_init(&wdtConfig);
-    esp_task_wdt_add(NULL);
-    #endif
+  Serial.println("\n=== Iniciando Sistema ESP32 Temperature ===");
+  Serial.println("\n=== INICIANDO SISTEMA ===");
   
   // Inicializar EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -154,6 +115,7 @@ void setup() {
 // Configurar MQTT apenas se não estiver em modo AP
   if (!isAPMode) {
     mqttClient.setServer(mqttConfig.server, mqttConfig.port);
+    mqttClient.setBufferSize(512);  // Aumentar buffer para suportar mensagens maiores
     // Tentar conectar imediatamente
     connectMQTT();
   }
@@ -168,25 +130,13 @@ void setup() {
   if (isAPMode) {
     Serial.println("Modo: AP (Aguardando configuração)");
     Serial.println("Conecte-se ao WiFi: ESP32-Temperature");
-        Serial.println("Senha: (aberta)");
+    Serial.println("Senha: 12345678");
     Serial.println("Acesse: http://192.168.4.1");
   } else {
     Serial.println("Modo: Estação WiFi");
     Serial.println("Acesse: http://" + WiFi.localIP().toString());
   }
 }
-
-void disableTaskWDT() {
-    esp_err_t err = esp_task_wdt_deinit();
-    if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_STATE) {
-        return;
-    }
-    if (err != ESP_OK) {
-        Serial.print("WDT deinit falhou: ");
-        Serial.println(err);
-    }
-}
-
 
 void setupDS18B20() {
   sensors.begin();
@@ -218,11 +168,6 @@ void setupDS18B20() {
 }
 
 void loop() {
-    // Resetar watchdog
-    #if ENABLE_WDT
-    esp_task_wdt_reset();
-    #endif
-  
   server.handleClient();
   
   if (!otaInProgress && !isAPMode) {
@@ -261,40 +206,12 @@ void loop() {
     
     mqttClient.loop();
 
-    if (!isAPMode && !otaInProgress && pendingOtaUrl.length() > 0 && WiFi.status() == WL_CONNECTED) {
-        String url = pendingOtaUrl;
-        pendingOtaUrl = "";
-        Serial.println("Iniciando OTA via comando MQTT: " + url);
-        performOTAUpload(url);
-    }
-
-        if (!isAPMode && mqttEverConnected) {
-            if (millis() - lastMqttActivity > MQTT_NO_COMM_TIMEOUT_MS) {
-                Serial.println("\n⚠️ Sem comunicacao MQTT por muito tempo. Reiniciando...");
-                shouldReboot = true;
+        if (mqttClient.connected()) {
+            unsigned long now = millis();
+            if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+                sendHeartbeat();
+                lastHeartbeat = now;
             }
-        }
-
-        // Heartbeat
-        static unsigned long lastHeartbeat = 0;
-        if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
-            connectMQTT();
-            if (mqttClient.connected()) {
-                String mac = WiFi.macAddress();
-                StaticJsonDocument<256> hb;
-                hb["mac"] = mac;
-                hb["ip"] = WiFi.localIP().toString();
-                hb["version"] = FIRMWARE_VERSION;
-                hb["uptime"] = millis() / 1000;
-                hb["rssi"] = WiFi.RSSI();
-                hb["heap"] = esp_get_free_heap_size();
-                char hbBuf[256];
-                serializeJson(hb, hbBuf);
-                if (mqttClient.publish("devices/heartbeat", hbBuf)) {
-                    lastMqttActivity = millis();
-                }
-            }
-            lastHeartbeat = millis();
         }
     
     // Leitura e envio de temperatura
@@ -326,42 +243,62 @@ void loadConfig() {
   EEPROM.get(WEB_CONFIG_ADDR, webAuthConfig);
   EEPROM.get(SENSOR_CONFIG_ADDR, sensorConfig);
 
-    // Garantir terminadores nulos
-    wifiConfig.ssid[sizeof(wifiConfig.ssid) - 1] = '\0';
-    wifiConfig.password[sizeof(wifiConfig.password) - 1] = '\0';
-    mqttConfig.server[sizeof(mqttConfig.server) - 1] = '\0';
-    mqttConfig.username[sizeof(mqttConfig.username) - 1] = '\0';
-    mqttConfig.password[sizeof(mqttConfig.password) - 1] = '\0';
-    mqttConfig.topic[sizeof(mqttConfig.topic) - 1] = '\0';
-    webAuthConfig.username[sizeof(webAuthConfig.username) - 1] = '\0';
-    webAuthConfig.password[sizeof(webAuthConfig.password) - 1] = '\0';
-    sensorConfig.sensorName[sizeof(sensorConfig.sensorName) - 1] = '\0';
-    sensorConfig.location[sizeof(sensorConfig.location) - 1] = '\0';
+  // VERIFICAÇÃO WIFI - Validar se os dados são válidos
+  bool wifiValid = true;
+  if (strlen(wifiConfig.ssid) == 0 || strlen(wifiConfig.ssid) > 31) {
+    wifiValid = false;
+  } else {
+    for (int i = 0; i < strlen(wifiConfig.ssid); i++) {
+      if (!isprint(wifiConfig.ssid[i]) || wifiConfig.ssid[i] < 32 || wifiConfig.ssid[i] > 126) {
+        wifiValid = false;
+        Serial.println("⚠️ SSID WiFi corrompido detectado!");
+        break;
+      }
+    }
+  }
+  
+  if (!wifiValid) {
+    Serial.println("⚠️ Configuração WiFi corrompida - limpando...");
+    memset(&wifiConfig, 0, sizeof(wifiConfig));
+  }
 
   // VERIFICAÇÃO MQTT - Validar se os dados são realmente inválidos (lixo da EEPROM)
-    bool mqttValid = true;
-
-    if (!isPrintableAscii(mqttConfig.server, sizeof(mqttConfig.server), false)) {
+  bool mqttValid = true;
+  
+  // Verificar se o servidor tem caracteres válidos
+  if (strlen(mqttConfig.server) == 0 || strlen(mqttConfig.server) > 63) {
+    mqttValid = false;
+  } else {
+    // Verificar se contém caracteres inválidos (lixo de memória)
+    for (int i = 0; i < strlen(mqttConfig.server); i++) {
+      if (!isprint(mqttConfig.server[i]) || mqttConfig.server[i] < 32 || mqttConfig.server[i] > 126) {
         mqttValid = false;
+        break;
+      }
     }
-    if (!isPrintableAscii(mqttConfig.topic, sizeof(mqttConfig.topic), false)) {
+  }
+  
+  // Verificar porta válida (1-65535)
+  if (mqttConfig.port < 1 || mqttConfig.port > 65535) {
+    mqttValid = false;
+  }
+  
+  // Verificar tópico
+  if (strlen(mqttConfig.topic) == 0 || strlen(mqttConfig.topic) > 63) {
+    mqttValid = false;
+  } else {
+    for (int i = 0; i < strlen(mqttConfig.topic); i++) {
+      if (!isprint(mqttConfig.topic[i]) || mqttConfig.topic[i] < 32 || mqttConfig.topic[i] > 126) {
         mqttValid = false;
+        Serial.println("⚠️ Tópico MQTT corrompido detectado!");
+        break;
+      }
     }
-    if (!isPrintableAscii(mqttConfig.username, sizeof(mqttConfig.username), true)) {
-        mqttValid = false;
-    }
-    if (!isPrintableAscii(mqttConfig.password, sizeof(mqttConfig.password), true)) {
-        mqttValid = false;
-    }
-
-    // Verificar porta válida (1-65535)
-    if (mqttConfig.port < 1 || mqttConfig.port > 65535) {
-        mqttValid = false;
-    }
+  }
   
   // Se configuração MQTT não for válida, definir padrão
   if (!mqttValid) {
-    Serial.println("Configuração MQTT inválida ou corrompida, usando padrão");
+    Serial.println("⚠️ Configuração MQTT inválida ou corrompida, usando padrão");
     strcpy(mqttConfig.server, "189.90.40.78");
     mqttConfig.port = 1883;
     strcpy(mqttConfig.username, "esp32");
@@ -369,21 +306,41 @@ void loadConfig() {
     strcpy(mqttConfig.topic, "esp32/temperature");
     saveConfig(); // Salvar os padrões
   } else {
-    Serial.println("Configuração MQTT carregada da EEPROM");
+    Serial.println("✅ Configuração MQTT carregada da EEPROM");
     Serial.println("  Servidor: " + String(mqttConfig.server));
     Serial.println("  Porta: " + String(mqttConfig.port));
+    Serial.println("  Tópico: " + String(mqttConfig.topic));
   }
   
   
   // Verificar se as credenciais web são válidas
-    bool credentialsValid = true;
-
-    if (!isPrintableAscii(webAuthConfig.username, sizeof(webAuthConfig.username), false)) {
+  bool credentialsValid = true;
+  
+  // Verificar se o username tem caracteres válidos
+  if (strlen(webAuthConfig.username) == 0 || strlen(webAuthConfig.username) > 30) {
+    credentialsValid = false;
+  } else {
+    // Verificar caracteres do username
+    for (int i = 0; i < strlen(webAuthConfig.username); i++) {
+      if (!isprint(webAuthConfig.username[i])) {
         credentialsValid = false;
+        break;
+      }
     }
-    if (!isPrintableAscii(webAuthConfig.password, sizeof(webAuthConfig.password), false)) {
+  }
+  
+  // Verificar se a senha tem caracteres válidos
+  if (strlen(webAuthConfig.password) == 0 || strlen(webAuthConfig.password) > 60) {
+    credentialsValid = false;
+  } else {
+    // Verificar caracteres da senha
+    for (int i = 0; i < strlen(webAuthConfig.password); i++) {
+      if (!isprint(webAuthConfig.password[i])) {
         credentialsValid = false;
+        break;
+      }
     }
+  }
   
   // Se as credenciais não forem válidas, definir padrão
   if (!credentialsValid) {
@@ -395,53 +352,81 @@ void loadConfig() {
   // Configurações WiFi - não definir SSID padrão para forçar configuração inicial
   // O modo AP será ativado automaticamente se não houver SSID configurado
 
-        if (!isPrintableAscii(sensorConfig.sensorName, sizeof(sensorConfig.sensorName), false)) {
-        strcpy(sensorConfig.sensorName, "DS18B20");
-        // Não definir localização padrão para forçar adoção via plataforma
-        sensorConfig.location[0] = '\0';
-        sensorConfig.readInterval = 300; // 5 minutos padrão
-        saveConfig();
-    }
-
-    if (!isPrintableAscii(sensorConfig.location, sizeof(sensorConfig.location), true)) {
-        sensorConfig.location[0] = '\0';
-        saveConfig();
-    }
-
-    bool wifiValid = true;
-    if (!isPrintableAscii(wifiConfig.ssid, sizeof(wifiConfig.ssid), false)) {
-        wifiValid = false;
-    }
-    if (!isPrintableAscii(wifiConfig.password, sizeof(wifiConfig.password), true)) {
-        wifiValid = false;
-    }
-    if (!wifiValid) {
-        wifiConfig.ssid[0] = '\0';
-        wifiConfig.password[0] = '\0';
-        saveConfig();
-    }
+  // Verificar e validar configurações do sensor
+  bool sensorValid = true;
   
-  // Validar intervalo de leitura
+  // Verificar nome do sensor
+  if (strlen(sensorConfig.sensorName) == 0 || strlen(sensorConfig.sensorName) > 31) {
+    sensorValid = false;
+  } else {
+    // Verificar caracteres válidos
+    for (int i = 0; i < strlen(sensorConfig.sensorName); i++) {
+      if (!isprint(sensorConfig.sensorName[i]) || sensorConfig.sensorName[i] < 32 || sensorConfig.sensorName[i] > 126) {
+        sensorValid = false;
+        Serial.println("⚠️ Nome do sensor corrompido detectado!");
+        break;
+      }
+    }
+  }
+  
+  // Verificar localização (pode estar vazia, mas não pode ter lixo)
+  if (strlen(sensorConfig.location) > 63) {
+    sensorValid = false;
+  } else if (strlen(sensorConfig.location) > 0) {
+    for (int i = 0; i < strlen(sensorConfig.location); i++) {
+      if (!isprint(sensorConfig.location[i]) || sensorConfig.location[i] < 32 || sensorConfig.location[i] > 126) {
+        sensorValid = false;
+        Serial.println("⚠️ Localização do sensor corrompida detectada!");
+        break;
+      }
+    }
+  }
+  
+  // Se configuração do sensor não for válida, definir padrão
+  if (!sensorValid) {
+    Serial.println("⚠️ Configuração do sensor inválida ou corrompida, usando padrão");
+    strcpy(sensorConfig.sensorName, "DS18B20");
+    sensorConfig.location[0] = '\0'; // Localização vazia
+    sensorConfig.readInterval = 300;
+    saveConfig();
+  }
+  
+  // Validar intervalo de leitura (10 segundos a 1 hora)
   if (sensorConfig.readInterval < 10 || sensorConfig.readInterval > 3600) {
-    sensorConfig.readInterval = 300; // Reset para padrão se inválido
+    sensorConfig.readInterval = 300; // 5 minutos padrão se fora do intervalo
   }
 }
 
 void saveConfig() {
-  Serial.println("=== SALVANDO CONFIGURAÇÕES NA EEPROM ===");
+  Serial.println("========================================");
+  Serial.println("💾 Salvando configurações na EEPROM...");
+  Serial.println("========================================");
   
+  // Salvar WiFi
+  Serial.println("📡 WiFi Config:");
+  Serial.println("   SSID: " + String(wifiConfig.ssid));
   EEPROM.put(WIFI_CONFIG_ADDR, wifiConfig);
-  Serial.println("✓ WiFi salvo - SSID: " + String(wifiConfig.ssid));
   
+  // Salvar MQTT
+  Serial.println("🔌 MQTT Config:");
+  Serial.println("   Servidor: " + String(mqttConfig.server));
+  Serial.println("   Porta: " + String(mqttConfig.port));
+  Serial.println("   Tópico: " + String(mqttConfig.topic));
   EEPROM.put(MQTT_CONFIG_ADDR, mqttConfig);
-  Serial.println("✓ MQTT salvo - Server: " + String(mqttConfig.server) + ":" + String(mqttConfig.port));
   
+  // Salvar Autenticação Web
+  Serial.println("🔐 Web Auth:");
+  Serial.println("   Usuário: " + String(webAuthConfig.username));
   EEPROM.put(WEB_CONFIG_ADDR, webAuthConfig);
-  Serial.println("✓ Web Auth salvo - User: " + String(webAuthConfig.username));
   
+  // Salvar Sensor
+  Serial.println("🌡️ Sensor Config:");
+  Serial.println("   Nome: " + String(sensorConfig.sensorName));
+  Serial.println("   Local: " + String(sensorConfig.location));
+  Serial.println("   Intervalo: " + String(sensorConfig.readInterval) + "s");
   EEPROM.put(SENSOR_CONFIG_ADDR, sensorConfig);
-  Serial.println("✓ Sensor salvo - Nome: " + String(sensorConfig.sensorName));
   
+  // Commit (gravar fisicamente na EEPROM)
   bool committed = EEPROM.commit();
   if (committed) {
     Serial.println("✅ EEPROM.commit() SUCESSO!");
@@ -482,113 +467,28 @@ void connectWiFi() {
 }
 
 void setupAPMode() {
-    Serial.println("Iniciando modo AP...");
-
-    // Para o WiFi anterior
-    WiFi.disconnect(true);
-    WiFi.softAPdisconnect(true);
-    delay(200);
-    yield();
-
-    // Configura como AP
-    WiFi.mode(WIFI_AP);
-    WiFi.setSleep(false);
-    delay(200);
-
-    // Configura IP padrao do AP
-    IPAddress apIP(192, 168, 4, 1);
-    IPAddress apGW(192, 168, 4, 1);
-    IPAddress apMask(255, 255, 255, 0);
-    if (!WiFi.softAPConfig(apIP, apGW, apMask)) {
-        Serial.println("Falha ao configurar IP do AP");
-    }
-    yield();
-
-    // Inicia o AP
-    bool apStarted = WiFi.softAP("ESP32-Temperature", "", 1, false, 4);
-    yield();
-
-    if (apStarted) {
-        isAPMode = true;
-        Serial.println("AP iniciado: ESP32-Temperature");
-        Serial.print("IP do AP: ");
-        Serial.println(WiFi.softAPIP());
-    } else {
-        Serial.println("Falha ao iniciar AP");
-    }
-}
-
-bool isPrintableAscii(const char* value, size_t maxLen, bool allowEmpty) {
-    size_t len = strnlen(value, maxLen);
-    if (!allowEmpty && len == 0) {
-        return false;
-    }
-    for (size_t i = 0; i < len; i++) {
-        if (!isprint(static_cast<unsigned char>(value[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-String htmlEscape(const String& input) {
-    String out;
-    out.reserve(input.length());
-    for (size_t i = 0; i < input.length(); i++) {
-        char c = input[i];
-        switch (c) {
-            case '&': out += "&amp;"; break;
-            case '<': out += "&lt;"; break;
-            case '>': out += "&gt;"; break;
-            case '"': out += "&quot;"; break;
-            case '\'': out += "&#39;"; break;
-            default: out += c; break;
-        }
-    }
-    return out;
-}
-
-String getCookieValue(const String& cookieHeader, const String& name) {
-    String key = name + "=";
-    int start = cookieHeader.indexOf(key);
-    if (start < 0) {
-        return "";
-    }
-    start += key.length();
-    int end = cookieHeader.indexOf(';', start);
-    if (end < 0) {
-        end = cookieHeader.length();
-    }
-    return cookieHeader.substring(start, end);
-}
-
-bool hasValidSession() {
-    if (sessionToken.length() == 0) {
-        return false;
-    }
-    if (sessionExpiresAt > 0 && millis() > sessionExpiresAt) {
-        clearSession();
-        return false;
-    }
-
-    String cookie = server.header("Cookie");
-    if (cookie.length() == 0) {
-        return false;
-    }
-    String token = getCookieValue(cookie, "VIATEMP_SESSION");
-    return token == sessionToken;
-}
-
-void createSession() {
-    sessionToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
-    sessionExpiresAt = millis() + SESSION_TTL_MS;
-    server.sendHeader("Set-Cookie", "VIATEMP_SESSION=" + sessionToken + "; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax");
-}
-
-void clearSession() {
-    sessionToken = "";
-    sessionExpiresAt = 0;
-    server.sendHeader("Set-Cookie", "VIATEMP_SESSION=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+  Serial.println("🔴 Iniciando modo AP...");
+  
+  // Para o WiFi anterior
+  WiFi.disconnect();
+  delay(500);
+  
+  // Configura como AP
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  
+  // Inicia o AP
+  bool apStarted = WiFi.softAP("ESP32-Temperature", "12345678");
+  
+  if (apStarted) {
+    isAPMode = true;
+    Serial.println("✅ Modo AP ativo");
+    Serial.println("   SSID: ESP32-Temperature");
+    Serial.println("   Password: 12345678");
+    Serial.println("   IP: " + WiFi.softAPIP().toString());
+  } else {
+    Serial.println("❌ Falha ao iniciar modo AP");
+  }
 }
 
 // Funções MQTT
@@ -608,58 +508,7 @@ void connectMQTT() {
             for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
             String t = String(topic);
             Serial.println("MQTT mensagem recebida -> Topic: " + t + " Payload: " + msg);
-
-            lastMqttActivity = millis();
-
-            if (t.endsWith("/config")) {
-                StaticJsonDocument<256> doc;
-                DeserializationError err = deserializeJson(doc, msg);
-                if (!err) {
-                    const char* name = doc["name"] | "";
-                    const char* location = doc["location"] | "";
-                    if (strlen(name) > 0) {
-                        strncpy(sensorConfig.sensorName, name, sizeof(sensorConfig.sensorName)-1);
-                        sensorConfig.sensorName[sizeof(sensorConfig.sensorName)-1] = '\\0';
-                    }
-                    if (strlen(location) > 0) {
-                        strncpy(sensorConfig.location, location, sizeof(sensorConfig.location)-1);
-                        sensorConfig.location[sizeof(sensorConfig.location)-1] = '\\0';
-                    }
-                    saveConfig();
-                    // Opcional: enviar ack
-                    String ackTopic = t + String("/ack");
-                    StaticJsonDocument<128> ack;
-                    ack["status"] = "adopted";
-                    ack["name"] = sensorConfig.sensorName;
-                    ack["location"] = sensorConfig.location;
-                    char buf[128];
-                    serializeJson(ack, buf);
-                    if (mqttClient.connected()) mqttClient.publish(ackTopic.c_str(), buf);
-                } else {
-                    Serial.println("Falha ao desserializar config JSON");
-                }
-            }
-            if (t.endsWith("/command")) {
-                StaticJsonDocument<256> cmd;
-                DeserializationError err = deserializeJson(cmd, msg);
-                if (!err) {
-                    const char* action = cmd["action"] | "";
-                    if (strcmp(action, "restart") == 0 || strcmp(action, "reboot") == 0) {
-                        Serial.println("Comando MQTT: reiniciar");
-                        shouldReboot = true;
-                    } else if (strcmp(action, "update") == 0 || strcmp(action, "ota") == 0) {
-                        const char* url = cmd["url"] | "";
-                        if (strlen(url) > 0) {
-                            pendingOtaUrl = String(url);
-                            Serial.println("Comando MQTT: atualizar firmware");
-                        } else {
-                            Serial.println("Comando MQTT: URL de firmware ausente");
-                        }
-                    }
-                } else {
-                    Serial.println("Falha ao desserializar command JSON");
-                }
-            }
+            // Callback simplificado - configuração via web interface
         });
 
         // Client ID único com MAC
@@ -671,26 +520,47 @@ void connectMQTT() {
 
         if (mqttClient.connect(clientId.c_str(), mqttConfig.username, mqttConfig.password)) {
             Serial.println(" Conectado!");
-            mqttEverConnected = true;
-            lastMqttActivity = millis();
-
-            // Assinar tópico de configuração específico do dispositivo
-            String cfgTopic = String("devices/") + macTopic + String("/config");
+            mqttFailCount = 0;
+            lastHeartbeat = 0;
+            
+            // Anunciar dispositivo para o servidor
+            String announceTopic = "devices/announce";
+            String announcePayload = "{";
+            announcePayload += "\"mac\":\"" + mac + "\",";
+            announcePayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+            announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
+            announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";
+            announcePayload += "\"location\":\"" + String(sensorConfig.location) + "\",";
+            announcePayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+            announcePayload += "\"heap\":" + String(esp_get_free_heap_size()) + ",";
+            announcePayload += "\"uptime\":" + String(millis() / 1000);
+            announcePayload += "}";
+            
+            Serial.println("📤 Enviando anúncio ao tópico: " + announceTopic);
+            Serial.println("   Tamanho: " + String(announcePayload.length()) + " bytes");
+            Serial.println("   Payload: " + announcePayload);
+            
+            // Publicar com QoS 1 e retained para garantir entrega
+            if (mqttClient.publish(announceTopic.c_str(), announcePayload.c_str(), true)) {
+                Serial.println("✅ Dispositivo anunciado ao servidor com sucesso!");
+            } else {
+                Serial.println("⚠️ Falha ao anunciar dispositivo ao servidor");
+                Serial.println("   Estado MQTT: " + String(mqttClient.state()));
+                Serial.println("   Buffer Size: " + String(mqttClient.getBufferSize()));
+            }
+            
+            // Subscrever tópico de configuração
+            String cfgTopic = "devices/" + macTopic + "/config";
             mqttClient.subscribe(cfgTopic.c_str());
-            String cmdTopic = String("devices/") + macTopic + String("/command");
-            mqttClient.subscribe(cmdTopic.c_str());
-
-            // Anunciar para o backend que estamos online
-            StaticJsonDocument<256> doc;
-            doc["mac"] = mac;
-            doc["ip"] = WiFi.localIP().toString();
-            doc["version"] = FIRMWARE_VERSION;
-            char outBuf[256];
-            serializeJson(doc, outBuf);
-            mqttClient.publish("devices/announce", outBuf);
+            Serial.println("📥 Inscrito no tópico: " + cfgTopic);
         } else {
             Serial.print(" Falha, rc=");
             Serial.println(mqttClient.state());
+            mqttFailCount++;
+            if (mqttFailCount >= 10) {
+              Serial.println("❌ MQTT falhou 10 vezes. Reiniciando...");
+              shouldReboot = true;
+            }
         }
     }
 }
@@ -730,9 +600,8 @@ void readAndSendTemperature() {
     // Obter informações adicionais
     unsigned long uptime = millis() / 1000;
     int rssi = WiFi.RSSI();
-        String mac = WiFi.macAddress();
     
-        String payload = "{\"mac\":\"" + mac + "\",\"temperature\":" + String(temperature, 2) + 
+    String payload = "{\"temperature\":" + String(temperature, 2) + 
                      ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
                      ",\"sensor\":\"" + String(sensorConfig.sensorName) + "\"" +
                      ",\"location\":\"" + String(sensorConfig.location) + "\"" +
@@ -744,7 +613,6 @@ void readAndSendTemperature() {
     if (mqttClient.connected()) {
       bool published = mqttClient.publish(mqttConfig.topic, payload.c_str());
       if (published) {
-                lastMqttActivity = millis();
         Serial.println("✅ Dados enviados: " + payload);
       } else {
         Serial.println("❌ Falha ao publicar MQTT");
@@ -755,7 +623,22 @@ void readAndSendTemperature() {
   } else {
     Serial.println("❌ Erro na leitura do sensor DS18B20");
   }
+}
 
+void sendHeartbeat() {
+    if (!mqttClient.connected()) return;
+
+    String mac = WiFi.macAddress();
+    String payload = "{";
+    payload += "\"mac\":\"" + mac + "\",";
+    payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    payload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
+    payload += "\"uptime\":" + String(millis() / 1000) + ",";
+    payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    payload += "\"heap\":" + String(esp_get_free_heap_size());
+    payload += "}";
+
+    mqttClient.publish("devices/heartbeat", payload.c_str());
 }
 
 String formatUptime(unsigned long seconds) {
@@ -783,13 +666,19 @@ String formatUptime(unsigned long seconds) {
 
 // Autenticação web
 bool isAuthenticated() {
-    if (hasValidSession()) {
-        return true;
-    }
-
-    server.sendHeader("Location", "/login");
-    server.send(302, "text/plain", "");
+  //Serial.println("=== TENTATIVA DE AUTENTICAÇÃO ===");
+  //Serial.print("Usuário esperado: ");
+  //Serial.println(webAuthConfig.username);
+  //Serial.print("Senha esperada: ");
+  //Serial.println(webAuthConfig.password);
+  
+  if (!server.authenticate(webAuthConfig.username, webAuthConfig.password)) {
+    //Serial.println("❌ AUTENTICAÇÃO FALHOU");
+    server.requestAuthentication();
     return false;
+  }
+  //Serial.println("✅ AUTENTICAÇÃO BEM-SUCEDIDA");
+  return true;
 }
 
 // Função para atualização OTA por URL
@@ -873,154 +762,6 @@ void performFactoryReset() {
 // Servidor Web com Interface Moderna
 void setupWebServer()
 {
-    const char* headers[] = {"Cookie"};
-    server.collectHeaders(headers, 1);
-
-  server.on("/login", HTTP_GET, []() {
-    String errorHtml = "";
-    if (server.hasArg("err")) {
-      errorHtml = "<div class='alert alert-error'>Usuario ou senha invalidos.</div>";
-    }
-
-    String html = R"=====(
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - ESP32 Temperature</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background: radial-gradient(circle at top, #eef2ff, #c7d2fe 45%, #a5b4fc 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0;
-            padding: 20px;
-            color: #0f172a;
-        }
-        .card {
-            width: 100%;
-            max-width: 420px;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 25px 50px rgba(15, 23, 42, 0.15);
-            border: 1px solid rgba(255, 255, 255, 0.6);
-            backdrop-filter: blur(10px);
-        }
-        .logo {
-            font-size: 2.2em;
-            text-align: center;
-            margin-bottom: 10px;
-        }
-        h1 {
-            text-align: center;
-            margin: 0 0 8px 0;
-            color: #3730a3;
-        }
-        p {
-            text-align: center;
-            margin: 0 0 20px 0;
-            color: #475569;
-        }
-        .alert {
-            padding: 12px 14px;
-            border-radius: 8px;
-            margin-bottom: 16px;
-            font-weight: 600;
-        }
-        .alert-error {
-            background: #fee2e2;
-            color: #991b1b;
-            border: 1px solid #fecaca;
-        }
-        .form-group {
-            margin-bottom: 18px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #1f2937;
-        }
-        input {
-            width: 100%;
-            padding: 12px 14px;
-            border: 2px solid #e5e7eb;
-            border-radius: 10px;
-            font-size: 16px;
-            outline: none;
-        }
-        input:focus {
-            border-color: #6366f1;
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-        }
-        .btn {
-            width: 100%;
-            padding: 14px 16px;
-            border: none;
-            border-radius: 12px;
-            background: linear-gradient(135deg, #6366f1, #4f46e5);
-            color: white;
-            font-weight: 700;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        .btn:hover { opacity: 0.95; }
-        .hint {
-            margin-top: 16px;
-            font-size: 0.85em;
-            color: #64748b;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="logo">🔐</div>
-        <h1>Login</h1>
-        <p>ESP32 Temperature Monitor</p>
-        )=====";
-    html += errorHtml;
-    html += R"=====(
-        <form method="POST" action="/dologin">
-            <div class="form-group">
-                <label>Usuario</label>
-                <input type="text" name="username" required>
-            </div>
-            <div class="form-group">
-                <label>Senha</label>
-                <input type="password" name="password" required>
-            </div>
-            <button type="submit" class="btn">Entrar</button>
-        </form>
-        <div class="hint">Acesso restrito ao administrador.</div>
-    </div>
-</body>
-</html>
-    )=====";
-
-    server.send(200, "text/html", html);
-  });
-
-  server.on("/dologin", HTTP_POST, []() {
-    String user = server.arg("username");
-    String pass = server.arg("password");
-
-    if (user == webAuthConfig.username && pass == webAuthConfig.password) {
-      createSession();
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "");
-      return;
-    }
-
-    server.sendHeader("Location", "/login?err=1");
-    server.send(302, "text/plain", "");
-  });
-
   server.on("/", HTTP_GET, []() {
     if (!isAuthenticated()) return;
     
@@ -1230,35 +971,6 @@ void setupWebServer()
 
 server.on("/wifi", HTTP_GET, []() {
     if (!isAuthenticated()) return;
-
-    String networksHtml = "";
-    if (WiFi.getMode() == WIFI_MODE_AP) {
-        WiFi.mode(WIFI_AP_STA);
-        delay(100);
-    }
-
-    int n = WiFi.scanNetworks();
-    if (n <= 0) {
-        networksHtml += "<div class='alert alert-warn'>Nenhuma rede encontrada. Tente novamente.</div>";
-    } else {
-        networksHtml += "<div class='networks'>";
-        for (int i = 0; i < n; i++) {
-            String ssid = htmlEscape(WiFi.SSID(i));
-            int rssi = WiFi.RSSI(i);
-            wifi_auth_mode_t enc = WiFi.encryptionType(i);
-            bool open = (enc == WIFI_AUTH_OPEN);
-            String encLabel = open ? "Aberta" : "Protegida";
-
-            networksHtml += "<label class='net-item'>";
-            networksHtml += "<input type='radio' name='ssid_pick' value='" + ssid + "' data-open='" + String(open ? "1" : "0") + "'>";
-            networksHtml += "<div class='net-info'>";
-            networksHtml += "<div class='net-ssid'>" + ssid + "</div>";
-            networksHtml += "<div class='net-meta'>" + encLabel + " | RSSI " + String(rssi) + " dBm</div>";
-            networksHtml += "</div>";
-            networksHtml += "</label>";
-        }
-        networksHtml += "</div>";
-    }
     
     String html = R"=====(
 <!DOCTYPE html>
@@ -1351,36 +1063,44 @@ server.on("/wifi", HTTP_GET, []() {
             color: #065f46;
             border: 1px solid #a7f3d0;
         }
-        .alert-warn {
-            background: #fef3c7;
-            color: #92400e;
-            border: 1px solid #f59e0b;
-        }
-        .networks {
-            border: 2px dashed #e5e7eb;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 20px;
-            max-height: 240px;
+        .wifi-list {
+            margin: 20px 0;
+            max-height: 300px;
             overflow-y: auto;
-        }
-        .net-item {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 10px;
+            border: 1px solid #e5e7eb;
             border-radius: 6px;
-            cursor: pointer;
         }
-        .net-item:hover { background: #f3f4f6; }
-        .net-ssid { font-weight: 700; }
-        .net-meta { font-size: 0.85em; color: #6b7280; }
-        .net-info { display: flex; flex-direction: column; }
+        .wifi-item {
+            padding: 12px 15px;
+            border-bottom: 1px solid #e5e7eb;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .wifi-item:hover {
+            background: #f3f4f6;
+        }
+        .wifi-item:last-child {
+            border-bottom: none;
+        }
+        .wifi-signal {
+            font-size: 18px;
+        }
         .btn-scan {
+            width: 100%;
+            margin-bottom: 10px;
             background: #3b82f6;
             color: white;
         }
-        .btn-scan:hover { background: #2563eb; }
+        .btn-scan:hover {
+            background: #2563eb;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #6b7280;
+        }
     </style>
 </head>
 <body>
@@ -1390,26 +1110,21 @@ server.on("/wifi", HTTP_GET, []() {
                 <h1>📶 Configurar WiFi</h1>
                 <p>Configure a rede WiFi para conectar o ESP32</p>
             </div>
-            <div class="alert alert-info">💡 Digite os dados exatos da sua rede WiFi</div>
-            <div class="form-group">
-                <label class="form-label">Redes Disponíveis</label>
-                )=====";
-    html += networksHtml;
-    html += R"=====(
-                <div class="btn-group" style="margin-top: 10px;">
-                    <button type="button" class="btn btn-scan" onclick="window.location.reload()">🔍 Reescanear</button>
-                </div>
-            </div>
+            
+            <button onclick="scanWiFi()" class="btn btn-scan" id="scanBtn">🔍 Escanear Redes WiFi</button>
+            <div id="wifiList" style="display:none;"></div>
+            
+            <div class="alert alert-info">💡 Clique em uma rede ou digite manualmente</div>
             <form method="POST" action="/savewifi">
                 <div class="form-group">
                     <label class="form-label">Nome da Rede (SSID)</label>
-                    <input type="text" class="form-input" name="ssid" value=")=====";
+                    <input type="text" class="form-input" id="ssidInput" name="ssid" value=")=====";
     html += String(wifiConfig.ssid);
     html += R"=====(" placeholder="Ex: MinhaRedeWiFi" required>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Senha da Rede</label>
-                    <input type="password" class="form-input" id="passwordInput" name="password" value=")=====";
+                    <input type="password" class="form-input" name="password" value=")=====";
     html += String(wifiConfig.password);
     html += R"=====(" placeholder="Senha do WiFi">
                 </div>
@@ -1420,32 +1135,53 @@ server.on("/wifi", HTTP_GET, []() {
             </form>
         </div>
     </div>
+    
     <script>
-        const ssidInput = document.querySelector('input[name="ssid"]');
-        const passwordInput = document.getElementById('passwordInput');
-        const radios = document.querySelectorAll('input[name="ssid_pick"]');
-
-        function togglePassword(isOpen) {
-            if (isOpen) {
-                passwordInput.value = '';
-                passwordInput.placeholder = 'Rede aberta (sem senha)';
-                passwordInput.parentElement.style.display = 'none';
-            } else {
-                passwordInput.placeholder = 'Senha do WiFi';
-                passwordInput.parentElement.style.display = 'block';
-            }
+        function scanWiFi() {
+            const btn = document.getElementById('scanBtn');
+            const listDiv = document.getElementById('wifiList');
+            
+            btn.disabled = true;
+            btn.textContent = '⏳ Escaneando...';
+            listDiv.innerHTML = '<div class="loading">🔍 Procurando redes WiFi...</div>';
+            listDiv.style.display = 'block';
+            
+            fetch('/scanwifi')
+                .then(response => response.json())
+                .then(data => {
+                    btn.disabled = false;
+                    btn.textContent = '🔍 Escanear Redes WiFi';
+                    
+                    if (data.count === 0) {
+                        listDiv.innerHTML = '<div class="loading">❌ Nenhuma rede encontrada</div>';
+                        return;
+                    }
+                    
+                    let html = '<div class="wifi-list">';
+                    data.networks.forEach(network => {
+                        const signal = network.rssi > -50 ? '📶📶📶📶' : 
+                                      network.rssi > -60 ? '📶📶📶' : 
+                                      network.rssi > -70 ? '📶📶' : '📶';
+                        const lock = network.encryption != 7 ? '🔒' : '🔓';
+                        html += `<div class="wifi-item" onclick="selectNetwork('${network.ssid}')">
+                                   <span>${lock} ${network.ssid}</span>
+                                   <span class="wifi-signal">${signal} ${network.rssi}dBm</span>
+                                 </div>`;
+                    });
+                    html += '</div>';
+                    listDiv.innerHTML = html;
+                })
+                .catch(error => {
+                    btn.disabled = false;
+                    btn.textContent = '🔍 Escanear Redes WiFi';
+                    listDiv.innerHTML = '<div class="loading">❌ Erro ao escanear redes</div>';
+                    console.error('Erro:', error);
+                });
         }
-
-        radios.forEach(r => {
-            r.addEventListener('change', () => {
-                ssidInput.value = r.value;
-                const isOpen = r.dataset.open === '1';
-                togglePassword(isOpen);
-            });
-        });
-
-        if (passwordInput && passwordInput.value.length === 0) {
-            togglePassword(false);
+        
+        function selectNetwork(ssid) {
+            document.getElementById('ssidInput').value = ssid;
+            document.getElementById('wifiList').style.display = 'none';
         }
     </script>
 </body>
@@ -1454,6 +1190,36 @@ server.on("/wifi", HTTP_GET, []() {
     
     server.send(200, "text/html", html);
 });
+
+  // Rota para escanear redes WiFi disponíveis
+  server.on("/scanwifi", HTTP_GET, []() {
+    if (!isAuthenticated()) return;
+    
+    Serial.println("🔍 Iniciando scan de redes WiFi...");
+    int n = WiFi.scanNetworks();
+    
+    String json = "{\"networks\":[";
+    
+    if (n == 0) {
+      json += "],\"count\":0}";
+    } else {
+      for (int i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        json += "{";
+        json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+        json += "\"encryption\":" + String(WiFi.encryptionType(i));
+        json += "}";
+      }
+      json += "],\"count\":" + String(n) + "}";
+    }
+    
+    Serial.println("✅ Scan concluído: " + String(n) + " redes encontradas");
+    server.send(200, "application/json", json);
+    
+    // Limpar resultados do scan
+    WiFi.scanDelete();
+  });
 
   server.on("/savewifi", HTTP_POST, []() {
     if (!isAuthenticated()) return;
@@ -2179,10 +1945,8 @@ server.on("/firmware", HTTP_GET, []() {
 
 // Logout - Versão com Estilo Unificado
 server.on("/logout", []() {
-  Serial.println("👤 Usuario solicitou logout");
-
-  clearSession();
-
+  Serial.println("👤 Usuário solicitou logout");
+  
   String html = R"=====(
 <!DOCTYPE html>
 <html>
@@ -2192,25 +1956,22 @@ server.on("/logout", []() {
     <title>Logout - ESP32 Temperature</title>
     <style>
         body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background: radial-gradient(circle at top, #eef2ff, #c7d2fe 45%, #a5b4fc 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            font-family: Arial, sans-serif;
+            background: #f8f9fa;
             margin: 0;
             padding: 20px;
-            color: #0f172a;
+            color: #333;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
         }
         .card {
-            width: 100%;
-            max-width: 420px;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
+            background: white;
             padding: 40px;
-            box-shadow: 0 25px 50px rgba(15, 23, 42, 0.15);
-            border: 1px solid rgba(255, 255, 255, 0.6);
-            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-left: 5px solid #10b981;
             text-align: center;
         }
         .success-icon {
@@ -2218,37 +1979,108 @@ server.on("/logout", []() {
             margin-bottom: 20px;
         }
         h1 {
-            color: #3730a3;
-            margin-bottom: 10px;
+            color: #10b981;
+            margin-bottom: 15px;
+            font-size: 2.2em;
         }
         p {
-            color: #475569;
+            color: #6b7280;
+            margin-bottom: 15px;
+            line-height: 1.5;
         }
         .btn {
             display: inline-block;
-            padding: 14px 20px;
-            margin-top: 20px;
-            background: linear-gradient(135deg, #6366f1, #4f46e5);
+            padding: 15px 30px;
+            background: #10b981;
             color: white;
             text-decoration: none;
-            border-radius: 12px;
-            font-weight: 700;
+            border-radius: 6px;
+            font-weight: 600;
+            margin-top: 25px;
+            transition: background 0.3s;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .btn:hover {
+            background: #0da271;
+        }
+        .login-info {
+            background: #f0f9ff;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 20px 0;
+            border: 1px solid #bae6fd;
         }
     </style>
 </head>
 <body>
-    <div class="card">
-        <div class="success-icon">✅</div>
-        <h1>Logout realizado</h1>
-        <p>Voce saiu do sistema com sucesso.</p>
-        <a href="/login" class="btn">🔐 Fazer login</a>
+    <div class="container">
+        <div class="card">
+            <div class="success-icon">✅</div>
+            <h1>Logout Realizado!</h1>
+            <p>Você foi desconectado com sucesso do sistema.</p>
+            
+            <div class="login-info">
+                <p><strong>Para acessar novamente:</strong></p>
+                <p>Clique no botão abaixo e informe suas credenciais</p>
+            </div>
+            
+            <a href="/" class="btn">🔐 Fazer Login Novamente</a>
+            
+            <div style="margin-top: 25px; font-size: 0.9em; color: #9ca3af;">
+                <p>Redirecionando automaticamente em <span id="countdown">10</span> segundos...</p>
+            </div>
+        </div>
     </div>
+    
+    <script>
+        // Forçar limpeza do cache de autenticação
+        function clearAuthCache() {
+            // Tentativas de limpar cache de autenticação
+            if (window.fetch) {
+                fetch('/', { 
+                    method: 'GET',
+                    headers: {
+                        'Authorization': 'Basic ' + btoa('logout:logout')
+                    }
+                }).catch(() => {});
+            }
+            
+            // Tentar fazer logout via XMLHttpRequest
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/', true, 'logout', 'logout');
+            xhr.send();
+        }
+        
+        // Redirecionamento automático
+        function startCountdown() {
+            let seconds = 10;
+            const countdownElement = document.getElementById('countdown');
+            const countdownInterval = setInterval(() => {
+                seconds--;
+                countdownElement.textContent = seconds;
+                
+                if (seconds <= 0) {
+                    clearInterval(countdownInterval);
+                    window.location.href = '/';
+                }
+            }, 1000);
+        }
+        
+        // Executar quando a página carregar
+        document.addEventListener('DOMContentLoaded', function() {
+            clearAuthCache();
+            startCountdown();
+            console.log('Logout realizado - cache limpo');
+        });
+    </script>
 </body>
 </html>
 )=====";
-
+  
   server.send(200, "text/html", html);
-  Serial.println("✅ Pagina de logout exibida");
+  Serial.println("✅ Página de logout exibida");
 });
 
   // Informações do sistema (JSON)
@@ -2268,7 +2100,7 @@ server.on("/logout", []() {
     json += "}";
     
     server.send(200, "application/json", json);
-    });
+  });
 
   // Handler para página não encontrada
   server.onNotFound([]() {
@@ -2495,38 +2327,38 @@ server.on("/password", HTTP_GET, []() {
         "<p>Usuário ou senha atual incorretos!</p>"
         "<a href='/password' style='display: inline-block; padding: 10px 20px; background: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;'>Voltar</a>"
         "</div></body></html>");
-            return;
-        }
-
-        if (newUsername.length() < 3 || newPassword.length() < 3 ||
-                newUsername.length() >= 32 || newPassword.length() >= 64) {
-            server.send(400, "text/html", 
-                "<html><body style='font-family: Arial; margin: 40px; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);'>"
-                "<div style='background: white; padding: 50px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center;'>"
-                "<h1 style='color: #ef4444; margin-bottom: 20px;'>❌ Erro</h1>"
-                "<p>Usuário deve ter entre 3 e 31 caracteres e senha entre 3 e 63.</p>"
-                "<a href='/password' style='display: inline-block; padding: 10px 20px; background: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;'>Voltar</a>"
-                "</div></body></html>");
-            return;
-        }
-
-        if (newPassword != confirmPassword) {
-            server.send(400, "text/html", 
-                "<html><body style='font-family: Arial; margin: 40px; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);'>"
-                "<div style='background: white; padding: 50px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center;'>"
-                "<h1 style='color: #ef4444; margin-bottom: 20px;'>❌ Erro</h1>"
-                "<p>As novas senhas não coincidem!</p>"
-                "<a href='/password' style='display: inline-block; padding: 10px 20px; background: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;'>Voltar</a>"
-                "</div></body></html>");
-            return;
-        }
+      return;
+    }
+    
+    // Verificar se senhas coincidem
+    if (newPassword != confirmPassword) {
+      server.send(400, "text/html", 
+        "<html><body style='font-family: Arial; margin: 40px; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);'>"
+        "<div style='background: white; padding: 50px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center;'>"
+        "<h1 style='color: #ef4444; margin-bottom: 20px;'>❌ Erro</h1>"
+        "<p>As novas senhas não coincidem!</p>"
+        "<a href='/password' style='display: inline-block; padding: 10px 20px; background: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;'>Voltar</a>"
+        "</div></body></html>");
+      return;
+    }
+    
+    // Verificar comprimento
+    if (newUsername.length() < 3 || newPassword.length() < 3 ||
+        newUsername.length() >= 32 || newPassword.length() >= 64) {
+      server.send(400, "text/html", 
+        "<html><body style='font-family: Arial; margin: 40px; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);'>"
+        "<div style='background: white; padding: 50px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center;'>"
+        "<h1 style='color: #ef4444; margin-bottom: 20px;'>❌ Erro</h1>"
+        "<p>Usuário deve ter entre 3 e 31 caracteres e senha entre 3 e 63 caracteres!</p>"
+        "<a href='/password' style='display: inline-block; padding: 10px 20px; background: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px;'>Voltar</a>"
+        "</div></body></html>");
+      return;
+    }
     
     // Salvar novas credenciais
     strcpy(webAuthConfig.username, newUsername.c_str());
     strcpy(webAuthConfig.password, newPassword.c_str());
     saveConfig();
-
-    clearSession();
     
     String html = R"=====(
 <!DOCTYPE html>
@@ -2713,6 +2545,30 @@ server.on("/sensor", HTTP_GET, []() {
             font-weight: 700;
             color: #1f2937;
         }
+        .btn-announce {
+            background: #8b5cf6;
+            color: white;
+            margin-top: 15px;
+        }
+        .btn-announce:hover {
+            background: #7c3aed;
+        }
+        #announceResult {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 6px;
+            display: none;
+        }
+        .result-success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #a7f3d0;
+        }
+        .result-error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fecaca;
+        }
     </style>
 </head>
 <body>
@@ -2735,6 +2591,8 @@ server.on("/sensor", HTTP_GET, []() {
     html += String(sensorConfig.location);
     html += R"=====(</span>
                 </div>
+                <button onclick="announceDevice()" class="btn btn-announce" id="announceBtn">📡 Anunciar ao Servidor</button>
+                <div id="announceResult"></div>
             </div>
             <form method="POST" action="/savesensor">
                 <div class="form-group">
@@ -2744,10 +2602,10 @@ server.on("/sensor", HTTP_GET, []() {
     html += R"=====(" placeholder="Ex: Sensor_Sala, Termometro_Cozinha" required>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Localização</label>
+                    <label class="form-label">Localização (opcional)</label>
                     <input type="text" class="form-input" name="location" value=")=====";
     html += String(sensorConfig.location);
-    html += R"=====(" placeholder="Ex: Sala, Cozinha, Quarto, Externo" required>
+    html += R"=====(" placeholder="Ex: Sala, Cozinha, Quarto, Externo">
                 </div>
                 <div class="btn-group">
                     <button type="submit" class="btn btn-primary">💾 Salvar Configuração</button>
@@ -2756,6 +2614,41 @@ server.on("/sensor", HTTP_GET, []() {
             </form>
         </div>
     </div>
+    
+    <script>
+        function announceDevice() {
+            const btn = document.getElementById('announceBtn');
+            const resultDiv = document.getElementById('announceResult');
+            
+            btn.disabled = true;
+            btn.textContent = '⏳ Anunciando...';
+            resultDiv.style.display = 'none';
+            
+            fetch('/announce')
+                .then(response => response.json())
+                .then(data => {
+                    btn.disabled = false;
+                    btn.textContent = '📡 Anunciar ao Servidor';
+                    resultDiv.style.display = 'block';
+                    
+                    if (data.status === 'success') {
+                        resultDiv.className = 'result-success';
+                        resultDiv.innerHTML = '✅ ' + data.message + '<br><small>' + data.payload + '</small>';
+                    } else {
+                        resultDiv.className = 'result-error';
+                        resultDiv.innerHTML = '❌ ' + data.message;
+                    }
+                })
+                .catch(error => {
+                    btn.disabled = false;
+                    btn.textContent = '📡 Anunciar ao Servidor';
+                    resultDiv.style.display = 'block';
+                    resultDiv.className = 'result-error';
+                    resultDiv.innerHTML = '❌ Erro ao anunciar dispositivo';
+                    console.error('Erro:', error);
+                });
+        }
+    </script>
 </body>
 </html>
     )=====";
@@ -2768,13 +2661,38 @@ server.on("/sensor", HTTP_GET, []() {
     if (!isAuthenticated()) return;
     
     String newSensorName = server.arg("sensor_name");
-        String newLocation = server.arg("location");
-    // Validar comprimentos para evitar buffer overflow
-        if (newSensorName.length() > 0 && newSensorName.length() < 32 && 
-                newLocation.length() > 0 && newLocation.length() < 64) {
-      strcpy(sensorConfig.sensorName, newSensorName.c_str());
-      strcpy(sensorConfig.location, newLocation.c_str());
+    String newLocation = server.arg("location");
+    
+    // Validar e sanitizar nome do sensor
+    bool valid = true;
+    if (newSensorName.length() == 0 || newSensorName.length() >= 32) {
+      valid = false;
+    }
+    
+    // Validar localização (pode estar vazia)
+    if (newLocation.length() >= 64) {
+      valid = false;
+    }
+    
+    if (valid) {
+      // Limpar buffers antes de copiar
+      memset(sensorConfig.sensorName, 0, sizeof(sensorConfig.sensorName));
+      memset(sensorConfig.location, 0, sizeof(sensorConfig.location));
+      
+      // Copiar dados sanitizados
+      strncpy(sensorConfig.sensorName, newSensorName.c_str(), sizeof(sensorConfig.sensorName) - 1);
+      sensorConfig.sensorName[sizeof(sensorConfig.sensorName) - 1] = '\0';
+      
+      if (newLocation.length() > 0) {
+        strncpy(sensorConfig.location, newLocation.c_str(), sizeof(sensorConfig.location) - 1);
+        sensorConfig.location[sizeof(sensorConfig.location) - 1] = '\0';
+      }
+      
       saveConfig();
+      
+      Serial.println("✅ Configuração do sensor atualizada:");
+      Serial.println("   Nome: " + String(sensorConfig.sensorName));
+      Serial.println("   Local: " + String(sensorConfig.location));
       
       String html = R"=====(
 <!DOCTYPE html>
@@ -2865,9 +2783,9 @@ server.on("/sensor", HTTP_GET, []() {
     Serial.println("   Nome: " + newSensorName);
     Serial.println("   Localização: " + newLocation);
     
-        } else {
-            server.send(400, "text/plain", "Nome do sensor e localizacao devem ter entre 1 e 31/63 caracteres");
-        }
+    } else {
+      server.send(400, "text/plain", "Nome do sensor e localização não podem estar vazios");
+    }
   });
 
     // Página de reinicialização
@@ -3663,6 +3581,56 @@ server.on("/admin", HTTP_GET, []() {
     
     server.send(200, "text/html", html);
 });
+
+  // Rota para reenviar anúncio ao servidor (readoção)
+  server.on("/announce", HTTP_GET, []() {
+    if (!isAuthenticated()) return;
+    
+    String json = "{";
+    
+    if (!mqttClient.connected()) {
+      connectMQTT();
+      delay(500);
+    }
+    
+    if (mqttClient.connected()) {
+      String mac = WiFi.macAddress();
+      String announceTopic = "devices/announce";
+      String announcePayload = "{";
+      announcePayload += "\"mac\":\"" + mac + "\",";
+      announcePayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+      announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
+      announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";
+      announcePayload += "\"location\":\"" + String(sensorConfig.location) + "\",";
+      announcePayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+      announcePayload += "\"heap\":" + String(esp_get_free_heap_size()) + ",";
+      announcePayload += "\"uptime\":" + String(millis() / 1000);
+      announcePayload += "}";
+      
+      Serial.println("📤 Anúncio manual - Tópico: " + announceTopic);
+      Serial.println("   Tamanho: " + String(announcePayload.length()) + " bytes");
+      Serial.println("   Payload: " + announcePayload);
+      
+      if (mqttClient.publish(announceTopic.c_str(), announcePayload.c_str(), true)) {
+        json += "\"status\":\"success\",";
+        json += "\"message\":\"Dispositivo anunciado com sucesso!\",";
+        json += "\"payload\":" + announcePayload;
+        json += "}";
+        Serial.println("✅ Dispositivo reanunciado manualmente ao servidor");
+      } else {
+        json += "\"status\":\"error\",";
+        json += "\"message\":\"Falha ao publicar no MQTT\"";
+        json += "}";
+        Serial.println("⚠️ Falha no anúncio manual - Estado: " + String(mqttClient.state()));
+      }
+    } else {
+      json += "\"status\":\"error\",";
+      json += "\"message\":\"MQTT não conectado\"";
+      json += "}";
+    }
+    
+    server.send(200, "application/json", json);
+  });
 
   server.begin();
   Serial.println("✅ Servidor web iniciado na porta 80");

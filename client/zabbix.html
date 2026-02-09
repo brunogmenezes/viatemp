@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Zabbix - Viatemp</title>
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="page-body">
+    <nav class="topbar">
+      <div class="top-left">
+        <a href="/" class="icon-btn" title="Voltar">←</a>
+        <h1 class="title">Integracao Zabbix</h1>
+      </div>
+      <div class="top-right">
+        <div class="user-menu" id="user-menu">
+          <button class="user-trigger" id="user-trigger" type="button">
+            <span class="user-avatar" id="user-avatar">U</span>
+            <span id="user-name" class="user">—</span>
+            <span class="chev">▾</span>
+          </button>
+          <div class="user-dropdown" id="user-dropdown">
+            <button id="profile-open" class="menu-item" type="button">Perfil</button>
+            <button id="logout" class="menu-item danger" type="button">Sair</button>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <main class="page">
+      <div class="page-header">
+        <div>
+          <h2>Configuracao do Zabbix</h2>
+          <p class="text-muted">Gerencie a integracao para criar hosts e enviar metricas.</p>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="card-title">Status da integracao</div>
+        <div class="zabbix-status" id="zabbix-status">Carregando...</div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Parametros</div>
+        <form id="zabbix-form" class="form-row zabbix-form">
+          <div class="field">
+            <label>API URL</label>
+            <input id="zabbix-api" placeholder="https://zbx.exemplo.com/api_jsonrpc.php" required />
+          </div>
+          <div class="field">
+            <label>Host group</label>
+            <input id="zabbix-group" placeholder="VIATEMP" required />
+          </div>
+          <div class="field zabbix-toggle">
+            <label>Ativo</label>
+            <label class="switch">
+              <input id="zabbix-enabled" type="checkbox" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <button class="btn btn-primary btn-pill" type="submit">Salvar</button>
+        </form>
+        <div class="zabbix-note">
+          O token da API deve estar configurado no servidor via variavel de ambiente.
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+    <script src="/zabbix.js"></script>
+  </body>
+</html>

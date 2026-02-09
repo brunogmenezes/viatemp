@@ -170,6 +170,7 @@ function createDeviceElement(d) {
   const btnRemove = el.querySelector('.remove');
   const btnRestart = el.querySelector('.restart');
   const btnUpdate = el.querySelector('.update');
+  const btnZabbix = el.querySelector('.zabbix-sync');
   if (d.adopted) {
     btnAdopt.textContent = 'Adotado';
     btnAdopt.disabled = true;
@@ -181,6 +182,9 @@ function createDeviceElement(d) {
   const updateAvailable = isUpdateAvailable(d.version);
   if (btnUpdate && (!updateAvailable || !online)) {
     btnUpdate.remove();
+  }
+  if (btnZabbix && !d.adopted) {
+    btnZabbix.remove();
   }
   btnAdopt.addEventListener('click', () => openDeviceModal(d, 'adopt'));
   btnDetails.addEventListener('click', () => openDeviceModal(d, 'details'));
@@ -248,6 +252,36 @@ function createDeviceElement(d) {
       // ignore parse errors
     }
     showToast(msg, { type: 'error', title: 'Firmware' });
+  });
+  if (btnZabbix && d.adopted) btnZabbix.addEventListener('click', async () => {
+    const ok = await confirmAction('Forcar envio de dados para o Zabbix agora?', {
+      title: 'Sync Zabbix',
+      okText: 'Enviar',
+      cancelText: 'Cancelar'
+    });
+    if (!ok) return;
+    const mac = d.mac.replace(/:/g, '').toLowerCase();
+    const res = await fetch(`/api/devices/${mac}/zabbix/sync`, {
+      method: 'POST',
+      headers: getAuthHeaders()
+    });
+    if (res.ok) {
+      showToast('Sincronizacao enviada ao Zabbix', { type: 'success', title: 'Zabbix' });
+      return;
+    }
+    if (res.status === 401) {
+      showToast('Sessao expirada. Faca login novamente.', { type: 'error', title: 'Zabbix' });
+      setTimeout(() => { window.location.href = '/login.html'; }, 800);
+      return;
+    }
+    let msg = 'Falha ao sincronizar com o Zabbix';
+    try {
+      const body = await res.json();
+      if (body && body.error) msg = `Falha ao sincronizar (${body.error})`;
+    } catch (e) {
+      // ignore parse errors
+    }
+    showToast(msg, { type: 'error', title: 'Zabbix' });
   });
   btnRemove.addEventListener('click', async () => {
     const ok = await confirmAction('Remover adoção deste dispositivo? Isso fará com que ele volte para não adotados.', {
