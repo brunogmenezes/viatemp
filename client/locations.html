@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Localidades - Viatemp</title>
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="page-body">
+    <nav class="topbar">
+      <div class="top-left">
+        <a href="/" class="icon-btn" title="Voltar">←</a>
+        <h1 class="title">Localidades</h1>
+      </div>
+      <div class="top-right">
+        <div class="user-menu" id="user-menu">
+          <button class="user-trigger" id="user-trigger" type="button">
+            <span class="user-avatar" id="user-avatar">U</span>
+            <span id="user-name" class="user">—</span>
+            <span class="chev">▾</span>
+          </button>
+          <div class="user-dropdown" id="user-dropdown">
+            <button id="profile-open" class="menu-item" type="button">Perfil</button>
+            <button id="logout" class="menu-item danger" type="button">Sair</button>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <main class="page">
+      <div class="page-header">
+        <div>
+          <h2>Gerenciar Localidades</h2>
+          <p class="text-muted">Organize os locais onde sensores podem ser adotados.</p>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="card-title">Nova Localidade</div>
+        <div class="form-row">
+          <div class="field">
+            <label>Nome</label>
+            <input id="loc-name" placeholder="Nome da localidade" />
+          </div>
+          <div class="field">
+            <label>Descricao</label>
+            <input id="loc-desc" placeholder="Descricao (opcional)" />
+          </div>
+          <button id="loc-create" class="btn btn-primary btn-pill">+ Criar</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Lista de Localidades</div>
+        <div class="locations-list" id="locations-list"></div>
+      </section>
+    </main>
+
+    <!-- Location Modal -->
+    <div id="loc-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel">
+        <button id="loc-modal-close" class="modal-close">✕</button>
+        <h2 id="loc-modal-title">Localidade</h2>
+        <div class="modal-grid only-info">
+          <div class="modal-info">
+            <div class="field">
+              <label>Nome</label>
+              <input id="loc-modal-name" type="text" />
+            </div>
+            <div class="field">
+              <label>Descricao</label>
+              <input id="loc-modal-desc" type="text" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="loc-modal-cancel" class="btn btn-ghost">Cancelar</button>
+          <button id="loc-modal-save" class="btn btn-primary">Salvar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel confirm-panel">
+        <button id="confirm-close" class="modal-close">✕</button>
+        <h2 id="confirm-title">Confirmar acao</h2>
+        <div id="confirm-message" class="confirm-message"></div>
+        <div class="modal-actions">
+          <button id="confirm-cancel" class="btn btn-ghost">Cancelar</button>
+          <button id="confirm-ok" class="btn btn-danger">Excluir</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profile Modal -->
+    <div id="profile-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel profile-panel">
+        <button id="profile-close" class="modal-close">✕</button>
+        <h2>Perfil</h2>
+        <div class="profile-body">
+          <div class="profile-badge" id="profile-avatar">U</div>
+          <div class="profile-meta">
+            <div class="profile-name" id="profile-name">—</div>
+            <div class="profile-role">Operador</div>
+          </div>
+          <div class="profile-detail">
+            <div class="label">Usuario</div>
+            <div class="value" id="profile-username">—</div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="profile-close-btn" class="btn btn-ghost">Fechar</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+    <script>
+      let locationsCache = [];
+      let activeLocation = null;
+      let locModalMode = 'view';
+
+      const locModal = document.getElementById('loc-modal');
+      const locModalTitle = document.getElementById('loc-modal-title');
+      const locModalName = document.getElementById('loc-modal-name');
+      const locModalDesc = document.getElementById('loc-modal-desc');
+      const locModalSave = document.getElementById('loc-modal-save');
+      const locModalClose = document.getElementById('loc-modal-close');
+      const locModalCancel = document.getElementById('loc-modal-cancel');
+
+      function openLocModal(location, mode){
+        if (!locModal) return;
+        activeLocation = location;
+        locModalMode = mode || 'view';
+        const isEdit = locModalMode === 'edit';
+        locModalTitle.textContent = isEdit ? 'Editar localidade' : 'Detalhes da localidade';
+        locModalName.value = location.name || '';
+        locModalDesc.value = location.description || '';
+        locModalName.disabled = !isEdit;
+        locModalDesc.disabled = !isEdit;
+        locModalSave.classList.toggle('hidden', !isEdit);
+        locModal.setAttribute('aria-hidden', 'false');
+        locModal.classList.add('open');
+      }
+
+      function closeLocModal(){
+        if (!locModal) return;
+        activeLocation = null;
+        locModal.setAttribute('aria-hidden', 'true');
+        locModal.classList.remove('open');
+      }
+
+      if (locModalClose) locModalClose.addEventListener('click', closeLocModal);
+      if (locModalCancel) locModalCancel.addEventListener('click', closeLocModal);
+      if (locModal) {
+        const backdrop = locModal.querySelector('.modal-backdrop');
+        if (backdrop) backdrop.addEventListener('click', closeLocModal);
+      }
+
+      if (locModalSave) {
+        locModalSave.addEventListener('click', async () => {
+          if (!activeLocation) return;
+          const name = locModalName.value.trim();
+          const description = locModalDesc.value.trim();
+          if (!name) {
+            showToast('Informe um nome para a localidade', { type: 'error', title: 'Validacao' });
+            return;
+          }
+          const res = await fetch('/api/locations/' + activeLocation.id, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ name, description })
+          });
+          if (res.ok) {
+            closeLocModal();
+            loadLocations();
+            showToast('Localidade atualizada', { type: 'success', title: 'Atualizacao' });
+          } else {
+            showToast('Erro ao atualizar localidade', { type: 'error', title: 'Atualizacao' });
+          }
+        });
+      }
+
+      async function loadLocations(){
+        const list = document.getElementById('locations-list');
+        list.innerHTML='';
+        try {
+          const res = await fetch('/api/locations', { headers: getAuthHeaders() });
+          if (!res.ok) {
+            showToast('Erro ao carregar localidades', { type: 'error', title: 'Localidades' });
+            list.innerHTML = '<div class="empty">Erro ao carregar localidades.</div>';
+            return;
+          }
+          const data = await res.json();
+          locationsCache = Array.isArray(data) ? data : [];
+          if (!locationsCache.length) {
+            list.innerHTML = '<div class="empty">Nenhuma localidade cadastrada.</div>';
+            return;
+          }
+          locationsCache.forEach(l=>{
+            const created = l.created_at ? new Date(l.created_at) : null;
+            const createdLabel = created ? created.toLocaleDateString('pt-BR') : '—';
+            const el = document.createElement('div');
+            el.className='loc-item';
+            el.innerHTML = `
+              <div class='left'>
+                <div class='name'>${l.name}</div>
+                <div class='desc'>${l.description || 'Sem descricao'}</div>
+                <div class='meta'>Criado em ${createdLabel}</div>
+              </div>
+              <div class='loc-actions'>
+                <button data-id='${l.id}' class='action-btn view'>Ver</button>
+                <button data-id='${l.id}' class='action-btn edit'>Editar</button>
+                <button data-id='${l.id}' class='action-btn delete'>Excluir</button>
+              </div>`;
+            list.appendChild(el);
+          });
+          document.querySelectorAll('.action-btn.view').forEach(b=>b.addEventListener('click', onView));
+          document.querySelectorAll('.action-btn.edit').forEach(b=>b.addEventListener('click', onEdit));
+          document.querySelectorAll('.action-btn.delete').forEach(b=>b.addEventListener('click', onDelete));
+        } catch (e) {
+          showToast('Falha de rede ao carregar localidades', { type: 'error', title: 'Localidades' });
+          list.innerHTML = '<div class="empty">Falha de rede ao carregar localidades.</div>';
+        }
+      }
+
+      async function onView(e){
+        const id = e.target.dataset.id;
+        const loc = locationsCache.find(l => String(l.id) === String(id));
+        if (!loc) return;
+        openLocModal(loc, 'view');
+      }
+
+      async function onEdit(e){
+        const id = e.target.dataset.id;
+        const loc = locationsCache.find(l => String(l.id) === String(id));
+        if (!loc) return;
+        openLocModal(loc, 'edit');
+      }
+
+      async function onDelete(e){
+        const id = e.target.dataset.id;
+        const ok = await confirmAction('Excluir esta localidade? Esta acao nao pode ser desfeita.', {
+          title: 'Excluir localidade',
+          okText: 'Excluir',
+          cancelText: 'Cancelar'
+        });
+        if (!ok) return;
+        const res = await fetch('/api/locations/' + id, { method:'DELETE', headers: getAuthHeaders() });
+        if (res.ok) {
+          loadLocations();
+          showToast('Localidade excluida', { type: 'success', title: 'Exclusao' });
+        } else {
+          showToast('Erro ao excluir localidade', { type: 'error', title: 'Exclusao' });
+        }
+      }
+
+      document.getElementById('loc-create').addEventListener('click', async ()=>{
+        const name = document.getElementById('loc-name').value.trim(); const desc = document.getElementById('loc-desc').value.trim();
+        if(!name) return showToast('Nome obrigatorio', { type: 'error', title: 'Validacao' });
+        const res = await fetch('/api/locations', { method:'POST', headers: getAuthHeaders(), body: JSON.stringify({ name, description: desc }) });
+        if (res.ok) {
+          document.getElementById('loc-name').value='';
+          document.getElementById('loc-desc').value='';
+          loadLocations();
+          showToast('Localidade criada', { type: 'success', title: 'Criacao' });
+        } else {
+          showToast('Erro ao criar localidade', { type: 'error', title: 'Criacao' });
+        }
+      });
+
+      loadLocations();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Viatemp - Adoção de Sensores</title>
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">Viatemp</div>
+        <div class="sidebar-section search-wrap">
+          <input id="search" placeholder="Buscar sensores..." />
+        </div>
+        <div class="sidebar-section small-actions">
+          <button id="filter-all" class="small">Todos</button>
+          <button id="filter-unadopted" class="small">Não adotados</button>
+        </div>
+        <div class="sidebar-section">
+          <h4>Localidades</h4>
+          <ul id="locations" class="tree"></ul>
+        </div>
+      </aside>
+
+      <main class="main">
+        <nav class="topbar">
+          <div class="top-left">
+            <button id="toggle-sidebar" class="icon-btn">☰</button>
+            <h1 class="title">Adotar Sensores</h1>
+          </div>
+          <div class="top-right">
+            <a href="/locations.html" class="icon-btn" title="Localidades">📍</a>
+            <a href="/firmware.html" class="icon-btn" title="Firmware">⬆️</a>
+            <div class="user-menu" id="user-menu">
+              <button class="user-trigger" id="user-trigger" type="button">
+                <span class="user-avatar" id="user-avatar">U</span>
+                <span id="user-name" class="user">—</span>
+                <span class="chev">▾</span>
+              </button>
+              <div class="user-dropdown" id="user-dropdown">
+                <button id="profile-open" class="menu-item" type="button">Perfil</button>
+                <button id="logout" class="menu-item danger" type="button">Sair</button>
+              </div>
+            </div>
+          </div>
+        </nav>
+
+        <section class="kpi-grid" id="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-title">Total</div>
+            <div class="kpi-value" id="kpi-total">0</div>
+            <div class="kpi-meta">Sensores encontrados</div>
+          </div>
+          <div class="kpi-card kpi-success">
+            <div class="kpi-title">Adotados</div>
+            <div class="kpi-value" id="kpi-adopted">0</div>
+            <div class="kpi-meta">Vinculados a local</div>
+          </div>
+          <div class="kpi-card kpi-warning">
+            <div class="kpi-title">Disponiveis</div>
+            <div class="kpi-value" id="kpi-available">0</div>
+            <div class="kpi-meta">Aguardando adocao</div>
+          </div>
+          <div class="kpi-card kpi-danger">
+            <div class="kpi-title">Offline</div>
+            <div class="kpi-value" id="kpi-offline">0</div>
+            <div class="kpi-meta">Sem sinal recente</div>
+          </div>
+          <div class="kpi-card kpi-info">
+            <div class="kpi-title">Sem local</div>
+            <div class="kpi-value" id="kpi-noloc">0</div>
+            <div class="kpi-meta">Ainda nao vinculados</div>
+          </div>
+        </section>
+
+        <section id="content" class="content"></section>
+      </main>
+    </div>
+
+    <template id="device-template">
+      <div class="device-card">
+        <div class="left">
+          <div class="device-title">
+            <div class="name"></div>
+            <span class="status"></span>
+          </div>
+          <div class="chips">
+            <span class="chip chip-location"></span>
+            <span class="chip chip-temp"></span>
+            <span class="chip chip-ip"></span>
+            <span class="chip chip-uptime"></span>
+            <span class="chip chip-life"></span>
+          </div>
+          <div class="meta"></div>
+        </div>
+        <div class="right">
+          <button class="details">Detalhes</button>
+          <button class="restart">Reiniciar</button>
+          <button class="update">⟳ Atualizar</button>
+          <button class="adopt">Adotar</button>
+          <button class="remove">Remover</button>
+        </div>
+      </div>
+    </template>
+
+    <!-- Modal -->
+    <div id="modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel">
+        <button id="modal-close" class="modal-close">✕</button>
+        <h2 id="modal-title">Sensor</h2>
+        <div id="modal-body"></div>
+        <div class="modal-actions">
+          <button id="modal-cancel" class="btn btn-ghost">Cancelar</button>
+          <button id="modal-adopt" class="btn btn-primary">Adotar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel confirm-panel">
+        <button id="confirm-close" class="modal-close">✕</button>
+        <h2 id="confirm-title">Confirmar acao</h2>
+        <div id="confirm-message" class="confirm-message"></div>
+        <div class="modal-actions">
+          <button id="confirm-cancel" class="btn btn-ghost">Cancelar</button>
+          <button id="confirm-ok" class="btn btn-danger">Remover</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profile Modal -->
+    <div id="profile-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel profile-panel">
+        <button id="profile-close" class="modal-close">✕</button>
+        <h2>Perfil</h2>
+        <div class="profile-body">
+          <div class="profile-badge" id="profile-avatar">U</div>
+          <div class="profile-meta">
+            <div class="profile-name" id="profile-name">—</div>
+            <div class="profile-role">Operador</div>
+          </div>
+          <div class="profile-detail">
+            <div class="label">Usuario</div>
+            <div class="value" id="profile-username">—</div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="profile-close-btn" class="btn btn-ghost">Fechar</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "345f45a9e220": {
+    "mac": "34:5F:45:A9:E2:20",
+    "ip": "100.69.137.7",
+    "version": "3.0.0",
+    "uptime": 48723,
+    "rssi": -68,
+    "heap": 144540,
+    "lastSeen": 1770471430658,
+    "adopted": false,
+    "name": "",
+    "location": "",
+    "location_id": null
+  },
+  "ccdba73df610": {
+    "mac": "CC:DB:A7:3D:F6:10",
+    "ip": "100.69.137.68",
+    "version": "3.0.0",
+    "lastSeen": 1770638089936,
+    "adopted": true,
+    "name": "SALA NOC II",
+    "location": "PLANALTO",
+    "location_id": 2,
+    "uptime": 180,
+    "rssi": -74,
+    "heap": 144088,
+    "temperature": 25
+  },
+  "345f45ab2de0": {
+    "mac": "34:5F:45:AB:2D:E0",
+    "ip": "100.69.137.106",
+    "version": "3.0.0",
+    "lastSeen": 1770475238123,
+    "adopted": false
+  }
+}

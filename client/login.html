@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Login - Viatemp</title>
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div class="auth-page">
+      <div class="login-shell">
+        <div class="login-panel login-panel--brand">
+          <div class="login-brand">
+            <div class="login-brand-badge">VT</div>
+            <div>
+              <h1>Viatemp</h1>
+              <p>Plataforma de adoção e monitoramento de sensores</p>
+            </div>
+          </div>
+          <div class="login-highlights">
+            <div class="login-highlight"><span class="login-dot login-dot--success"></span>Cadastro centralizado</div>
+            <div class="login-highlight"><span class="login-dot login-dot--info"></span>Atualizações em tempo real</div>
+            <div class="login-highlight"><span class="login-dot login-dot--warning"></span>Histórico confiável</div>
+          </div>
+          <div class="login-footer">Acesso restrito a operadores autorizados</div>
+        </div>
+        <div class="login-panel login-panel--form">
+          <div class="login-card">
+            <div class="login-header">
+              <h2>Bem-vindo de volta</h2>
+              <p class="text-muted">Acesse sua conta para continuar</p>
+            </div>
+            <div id="login-alerts" class="alerts"></div>
+            <label class="login-label" for="username">Usuário</label>
+            <input id="username" placeholder="Digite seu usuário" autocomplete="username" />
+            <label class="login-label" for="password">Senha</label>
+            <input id="password" type="password" placeholder="Digite sua senha" autocomplete="current-password" />
+            <button id="login" class="btn btn-primary login-submit">Entrar</button>
+            <div class="muted small-note">Usuário padrão: admin / admin123</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/login.js"></script>
+  </body>
+</html>

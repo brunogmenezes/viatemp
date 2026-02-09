@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Firmware - Viatemp</title>
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="page-body">
+    <nav class="topbar">
+      <div class="top-left">
+        <a href="/" class="icon-btn" title="Voltar">←</a>
+        <h1 class="title">Firmware</h1>
+      </div>
+      <div class="top-right">
+        <div class="user-menu" id="user-menu">
+          <button class="user-trigger" id="user-trigger" type="button">
+            <span class="user-avatar" id="user-avatar">U</span>
+            <span id="user-name" class="user">—</span>
+            <span class="chev">▾</span>
+          </button>
+          <div class="user-dropdown" id="user-dropdown">
+            <button id="profile-open" class="menu-item" type="button">Perfil</button>
+            <button id="logout" class="menu-item danger" type="button">Sair</button>
+          </div>
+        </div>
+      </div>
+    </nav>
+
+    <main class="page">
+      <div class="page-header">
+        <div>
+          <h2>Gerenciar Firmware</h2>
+          <p class="text-muted">Envie arquivos .bin para hospedar e atualizar sensores remotamente.</p>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="card-title">Enviar novo firmware</div>
+        <form id="firmware-form" class="form-row firmware-form">
+          <div class="field">
+            <label>Versao</label>
+            <input id="firmware-version" placeholder="Ex: 3.1.0" required />
+          </div>
+          <div class="field">
+            <label>Arquivo (.bin)</label>
+            <input id="firmware-file" type="file" accept=".bin" required />
+          </div>
+          <button id="firmware-upload" class="btn btn-primary btn-pill" type="submit">Enviar</button>
+        </form>
+      </section>
+
+      <section class="card firmware-latest">
+        <div class="card-title">Ultima versao hospedada</div>
+        <div id="firmware-latest" class="firmware-empty">Nenhum firmware enviado.</div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Historico de firmware</div>
+        <div id="firmware-list" class="firmware-list"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+    <script src="/firmware.js"></script>
+  </body>
+</html>
