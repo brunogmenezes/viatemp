@@ -1,0 +1,6 @@
+# Ignore environment files
+*.env
+
+# Keep example files tracked
+!.env.example
+!**/.env.example
