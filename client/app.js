@@ -81,6 +81,74 @@ const HEARTBEAT_TTL_MS = 120000;
 const FIRMWARE_CACHE_MS = 60000;
 let latestFirmware = null;
 let latestFirmwareLoadedAt = 0;
+let cachedDevices = [];
+let realtimeSocket = null;
+const LOG_MAX_LINES = 500;
+let logLines = [];
+let logModalOpen = false;
+let logFilterValue = '';
+let logDeviceKey = 'all';
+
+function normalizeMacKey(mac) {
+  return String(mac || '').replace(/:/g, '').toLowerCase();
+}
+
+function resolveDeviceLabel(key) {
+  const device = cachedDevices.find(d => normalizeMacKey(d.mac) === key);
+  if (!device) return key || 'Desconhecido';
+  return device.name || device.mac || key;
+}
+
+function updateLogDeviceOptions() {
+  const select = document.getElementById('log-device');
+  if (!select) return;
+  const previous = select.value || 'all';
+  select.innerHTML = '';
+  const allOption = document.createElement('option');
+  allOption.value = 'all';
+  allOption.textContent = 'Todos os sensores';
+  select.appendChild(allOption);
+  cachedDevices
+    .filter(d => d && d.mac)
+    .sort((a, b) => String(a.name || a.mac).localeCompare(String(b.name || b.mac)))
+    .forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = normalizeMacKey(d.mac);
+      opt.textContent = d.name ? `${d.name} (${d.mac})` : d.mac;
+      select.appendChild(opt);
+    });
+  select.value = previous;
+}
+
+function renderLogLines() {
+  const output = document.getElementById('log-output');
+  if (!output) return;
+  const filtered = logLines.filter(entry => {
+    if (logDeviceKey !== 'all' && entry.macKey !== logDeviceKey) return false;
+    if (!logFilterValue) return true;
+    return entry.msg.toLowerCase().includes(logFilterValue);
+  });
+  output.textContent = filtered.map(entry => {
+    const label = resolveDeviceLabel(entry.macKey);
+    return `[${label}] ${entry.msg}`;
+  }).join('\n');
+  if (filtered.length) output.textContent += '\n';
+  output.scrollTop = output.scrollHeight;
+}
+
+function handleDeviceLog(entry) {
+  if (!entry || typeof entry.msg !== 'string' || !entry.msg.length) return;
+  const macKey = entry.macKey || normalizeMacKey(entry.mac);
+  logLines.push({
+    macKey,
+    mac: entry.mac || null,
+    msg: entry.msg,
+    ts: entry.ts || null,
+    seq: entry.seq || null
+  });
+  if (logLines.length > LOG_MAX_LINES) logLines.shift();
+  if (logModalOpen) renderLogLines();
+}
 
 function compareVersions(a, b) {
   const pa = String(a || '').split('.').map(n => parseInt(n, 10));
@@ -431,6 +499,8 @@ function renderAllGrouped(devices) {
 async function loadAndRender() {
   await refreshFirmwareLatest();
   const devices = await fetchDevices();
+  cachedDevices = Array.isArray(devices) ? devices : [];
+  updateLogDeviceOptions();
   const onlineDevices = devices.filter(d => d.online);
   const groupedDevices = devices.filter(d => d.adopted || d.online);
   renderKpis(devices);
@@ -505,9 +575,13 @@ if (document.getElementById('content')) {
   // Realtime updates via Socket.IO
   if (typeof io !== 'undefined') {
     const socket = io();
+    realtimeSocket = socket;
     socket.on('connect', () => console.log('Connected to realtime server'));
     socket.on('devices_updated', () => {
       loadAndRender();
+    });
+    socket.on('device_log', (entry) => {
+      handleDeviceLog(entry);
     });
   }
 }
@@ -521,6 +595,51 @@ const modalAdopt = document.getElementById('modal-adopt');
 const modalCancel = document.getElementById('modal-cancel');
 let modalDevice = null;
 let modalMode = 'details';
+
+const logOpenBtn = document.getElementById('log-open');
+const logModal = document.getElementById('log-modal');
+const logCloseBtn = document.getElementById('log-close');
+const logClearBtn = document.getElementById('log-clear');
+const logFilterInput = document.getElementById('log-filter');
+const logDeviceSelect = document.getElementById('log-device');
+
+function openLogModal() {
+  if (!logModal) return;
+  logModalOpen = true;
+  logModal.setAttribute('aria-hidden', 'false');
+  logModal.classList.add('open');
+  updateLogDeviceOptions();
+  if (logDeviceSelect) logDeviceKey = logDeviceSelect.value || 'all';
+  if (logFilterInput) logFilterValue = logFilterInput.value.toLowerCase().trim();
+  renderLogLines();
+  if (logFilterInput) logFilterInput.focus();
+}
+
+function closeLogModal() {
+  if (!logModal) return;
+  logModalOpen = false;
+  logModal.setAttribute('aria-hidden', 'true');
+  logModal.classList.remove('open');
+}
+
+if (logOpenBtn) logOpenBtn.addEventListener('click', openLogModal);
+if (logCloseBtn) logCloseBtn.addEventListener('click', closeLogModal);
+if (logClearBtn) logClearBtn.addEventListener('click', () => {
+  logLines = [];
+  renderLogLines();
+});
+if (logFilterInput) logFilterInput.addEventListener('input', (e) => {
+  logFilterValue = e.target.value.toLowerCase().trim();
+  renderLogLines();
+});
+if (logDeviceSelect) logDeviceSelect.addEventListener('change', (e) => {
+  logDeviceKey = e.target.value;
+  renderLogLines();
+});
+if (logModal) {
+  const backdrop = logModal.querySelector('.modal-backdrop');
+  if (backdrop) backdrop.addEventListener('click', closeLogModal);
+}
 
 function openDeviceModal(d, mode) {
   if (!modal || !modalBody || !modalTitle) return;

@@ -4,11 +4,54 @@
 #include <PubSubClient.h>
 #include <Update.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <ArduinoJson.h>
+#include <esp_system.h>
+
+void logAppendChar(uint8_t c);
+void addLogLine(const String &line);
+void publishLogLine(const String &line);
+void handleLogPublishQueue();
+void publishLogBacklog();
+String buildLogPayload(unsigned long seq, const String &line);
+String escapeJsonString(const String &input);
+void sendLogSnapshot(unsigned long sinceSeq);
+
+class LogSerialWrapper : public Print {
+public:
+    explicit LogSerialWrapper(HardwareSerial &serialRef) : serial(serialRef) {}
+
+    void begin(unsigned long baud) { serial.begin(baud); }
+    void begin(unsigned long baud, uint32_t config) { serial.begin(baud, config); }
+    void flush() { serial.flush(); }
+
+    size_t write(uint8_t c) override {
+        logAppendChar(c);
+        return serial.write(c);
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override {
+        for (size_t i = 0; i < size; i++) {
+            logAppendChar(buffer[i]);
+        }
+        return serial.write(buffer, size);
+    }
+
+    using Print::print;
+    using Print::println;
+    using Print::printf;
+
+private:
+    HardwareSerial &serial;
+};
+
+LogSerialWrapper LogSerial(::Serial);
+#define Serial LogSerial
 
 // Versão do firmware
-#define FIRMWARE_VERSION "3.0.1"
+#define FIRMWARE_VERSION "3.0.4"
 
 // Definições para DS18B20
 #define ONE_WIRE_BUS 4
@@ -18,6 +61,15 @@
 #define TEMP_READ_INTERVAL 300000  // 5 minutos
 // Intervalo do heartbeat em milissegundos
 #define HEARTBEAT_INTERVAL 60000  // 1 minuto
+
+// Botao BOOT (GPIO0) para reset de fabrica
+#define FACTORY_RESET_BUTTON_PIN 0
+#define FACTORY_RESET_HOLD_MS 10000
+
+// Log
+#define LOG_BUFFER_LINES 120
+#define LOG_MAX_LINE_LENGTH 256
+#define LOG_MQTT_MIN_INTERVAL_MS 200
 
 // Estruturas para configuração
 struct SensorConfig {
@@ -44,6 +96,11 @@ struct WebAuthConfig {
   char password[64];
 };
 
+struct LogEntry {
+    unsigned long seq;
+    String line;
+};
+
 // Objetos globais
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
@@ -61,6 +118,20 @@ bool shouldReboot = false;
 bool isAPMode = false;
 int mqttFailCount = 0;
 unsigned long lastHeartbeat = 0;
+unsigned long factoryResetPressStart = 0;
+bool factoryResetPressed = false;
+LogEntry logBuffer[LOG_BUFFER_LINES];
+unsigned int logBufferHead = 0;
+unsigned long logSeq = 0;
+String logLineBuffer;
+String deviceMac;
+String deviceMacTopic;
+String logMqttTopic;
+unsigned long lastLogPublishMs = 0;
+unsigned long lastLogPublishedSeq = 0;
+bool logPublishPending = false;
+unsigned long logPendingSeq = 0;
+String logPendingLine;
 
 // Endereços EEPROM
 #define EEPROM_SIZE 1024
@@ -89,6 +160,7 @@ void readAndSendTemperature();
 void sendHeartbeat();
 bool isAuthenticated();
 void setupWebServer();
+void handleFactoryResetButton();
 
 void setup() {
   Serial.begin(115200);
@@ -99,6 +171,22 @@ void setup() {
   
   // Inicializar EEPROM
   EEPROM.begin(EEPROM_SIZE);
+
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    uint8_t macBytes[6];
+    WiFi.macAddress(macBytes);
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+    deviceMac = String(macStr);
+    deviceMacTopic = deviceMac;
+    deviceMacTopic.replace(":", "");
+    deviceMacTopic.toLowerCase();
+    logMqttTopic = "devices/" + deviceMacTopic + "/log";
+
+    // BOOT (GPIO0) e ativo em nivel baixo
+    pinMode(FACTORY_RESET_BUTTON_PIN, INPUT_PULLUP);
   
   // Inicializar sensor DS18B20
   setupDS18B20();
@@ -168,6 +256,7 @@ void setupDS18B20() {
 }
 
 void loop() {
+    handleFactoryResetButton();
   server.handleClient();
   
   if (!otaInProgress && !isAPMode) {
@@ -205,6 +294,7 @@ void loop() {
     }
     
     mqttClient.loop();
+    handleLogPublishQueue();
 
         if (mqttClient.connected()) {
             unsigned long now = millis();
@@ -227,6 +317,173 @@ void loop() {
     delay(1000);
     ESP.restart();
   }
+}
+
+void handleFactoryResetButton() {
+    bool pressed = (digitalRead(FACTORY_RESET_BUTTON_PIN) == LOW);
+    unsigned long now = millis();
+
+    if (pressed) {
+        if (!factoryResetPressed) {
+            factoryResetPressed = true;
+            factoryResetPressStart = now;
+        }
+        return;
+    }
+
+    if (factoryResetPressed) {
+        unsigned long heldMs = now - factoryResetPressStart;
+        factoryResetPressed = false;
+        factoryResetPressStart = 0;
+
+        if (heldMs >= FACTORY_RESET_HOLD_MS) {
+            Serial.println("Botao BOOT segurado por 10s. Reset de fabrica...");
+            performFactoryReset();
+        }
+    }
+}
+
+void logAppendChar(uint8_t c) {
+    if (c == '\r') {
+        return;
+    }
+
+    if (c == '\n') {
+        if (logLineBuffer.length() > 0) {
+            addLogLine(logLineBuffer);
+            logLineBuffer = "";
+        }
+        return;
+    }
+
+    if (logLineBuffer.length() >= LOG_MAX_LINE_LENGTH) {
+        addLogLine(logLineBuffer);
+        logLineBuffer = "";
+    }
+
+    logLineBuffer += (char)c;
+}
+
+void addLogLine(const String &line) {
+    logSeq++;
+    logBuffer[logBufferHead].seq = logSeq;
+    logBuffer[logBufferHead].line = line;
+    logBufferHead = (logBufferHead + 1) % LOG_BUFFER_LINES;
+
+    publishLogLine(line);
+}
+
+void publishLogLine(const String &line) {
+    if (!mqttClient.connected() || logMqttTopic.length() == 0) {
+        return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastLogPublishMs < LOG_MQTT_MIN_INTERVAL_MS) {
+        logPublishPending = true;
+        logPendingSeq = logSeq;
+        logPendingLine = line;
+        return;
+    }
+
+    String payload = buildLogPayload(logSeq, line);
+    if (mqttClient.publish(logMqttTopic.c_str(), payload.c_str())) {
+        lastLogPublishMs = now;
+        lastLogPublishedSeq = logSeq;
+    }
+}
+
+void handleLogPublishQueue() {
+    if (!logPublishPending || !mqttClient.connected() || logMqttTopic.length() == 0) {
+        return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastLogPublishMs < LOG_MQTT_MIN_INTERVAL_MS) {
+        return;
+    }
+
+    String payload = buildLogPayload(logPendingSeq, logPendingLine);
+    if (mqttClient.publish(logMqttTopic.c_str(), payload.c_str())) {
+        lastLogPublishMs = now;
+        lastLogPublishedSeq = logPendingSeq;
+        logPublishPending = false;
+        logPendingSeq = 0;
+        logPendingLine = "";
+    }
+}
+
+void publishLogBacklog() {
+    if (!mqttClient.connected() || logMqttTopic.length() == 0) {
+        return;
+    }
+
+    for (unsigned int i = 0; i < LOG_BUFFER_LINES; i++) {
+        unsigned int index = (logBufferHead + i) % LOG_BUFFER_LINES;
+        if (logBuffer[index].seq == 0) {
+            continue;
+        }
+        if (logBuffer[index].seq <= lastLogPublishedSeq) {
+            continue;
+        }
+
+        unsigned long now = millis();
+        if (now - lastLogPublishMs < LOG_MQTT_MIN_INTERVAL_MS) {
+            delay(LOG_MQTT_MIN_INTERVAL_MS - (now - lastLogPublishMs));
+        }
+
+        String payload = buildLogPayload(logBuffer[index].seq, logBuffer[index].line);
+        if (mqttClient.publish(logMqttTopic.c_str(), payload.c_str())) {
+            lastLogPublishMs = millis();
+            lastLogPublishedSeq = logBuffer[index].seq;
+        }
+    }
+}
+
+String buildLogPayload(unsigned long seq, const String &line) {
+    String payload = "{\"seq\":" + String(seq) + ",\"ts\":" + String(millis()) + ",\"msg\":\"" +
+                                     escapeJsonString(line) + "\"}";
+    return payload;
+}
+
+String escapeJsonString(const String &input) {
+    String out;
+    out.reserve(input.length() + 8);
+    for (size_t i = 0; i < input.length(); i++) {
+        char c = input[i];
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+void sendLogSnapshot(unsigned long sinceSeq) {
+    String json = "{\"nextSeq\":" + String(logSeq) + ",\"lines\":[";
+    bool first = true;
+
+    for (unsigned int i = 0; i < LOG_BUFFER_LINES; i++) {
+        unsigned int index = (logBufferHead + i) % LOG_BUFFER_LINES;
+        if (logBuffer[index].seq == 0) {
+            continue;
+        }
+        if (logBuffer[index].seq <= sinceSeq) {
+            continue;
+        }
+        if (!first) {
+            json += ",";
+        }
+        json += "{\"seq\":" + String(logBuffer[index].seq) + ",\"msg\":\"" +
+                        escapeJsonString(logBuffer[index].line) + "\"}";
+        first = false;
+    }
+
+    json += "]}";
+    server.send(200, "application/json", json);
 }
 
 // Funções de configuração
@@ -450,8 +707,8 @@ void connectWiFi() {
   
   WiFi.begin(wifiConfig.ssid, wifiConfig.password);
   
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 15) {
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
     delay(1000);
     Serial.print(".");
     attempts++;
@@ -508,15 +765,46 @@ void connectMQTT() {
             for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
             String t = String(topic);
             Serial.println("MQTT mensagem recebida -> Topic: " + t + " Payload: " + msg);
-            // Callback simplificado - configuração via web interface
+            StaticJsonDocument<256> doc;
+            DeserializationError err = deserializeJson(doc, msg);
+            if (err) {
+              Serial.println("Falha ao desserializar comando MQTT");
+              return;
+            }
+
+            if (t.endsWith("/config")) {
+                const char* name = doc["name"] | "";
+                const char* location = doc["location"] | "";
+                if (strlen(name) > 0) {
+                    strncpy(sensorConfig.sensorName, name, sizeof(sensorConfig.sensorName) - 1);
+                    sensorConfig.sensorName[sizeof(sensorConfig.sensorName) - 1] = '\0';
+                }
+                if (strlen(location) > 0) {
+                    strncpy(sensorConfig.location, location, sizeof(sensorConfig.location) - 1);
+                    sensorConfig.location[sizeof(sensorConfig.location) - 1] = '\0';
+                }
+                saveConfig();
+                return;
+            }
+
+            if (t.endsWith("/command")) {
+                const char* action = doc["action"] | "";
+                if (strcmp(action, "restart") == 0) {
+                    Serial.println("Reinicio solicitado via MQTT");
+                    delay(500);
+                    ESP.restart();
+                }
+                if (strcmp(action, "update") == 0 || strcmp(action, "ota") == 0) {
+                    const char* url = doc["url"] | "";
+                    if (strlen(url) > 0) {
+                        performOTAUpload(String(url));
+                    }
+                }
+            }
         });
 
-        // Client ID único com MAC
-        String mac = WiFi.macAddress();
-        String macTopic = mac;
-        macTopic.replace(":", "");
-        macTopic.toLowerCase();
-        String clientId = "ESP32_Temp_" + macTopic;
+        // Client ID unico com MAC
+        String clientId = "ESP32_Temp_" + deviceMacTopic;
 
         if (mqttClient.connect(clientId.c_str(), mqttConfig.username, mqttConfig.password)) {
             Serial.println(" Conectado!");
@@ -526,7 +814,7 @@ void connectMQTT() {
             // Anunciar dispositivo para o servidor
             String announceTopic = "devices/announce";
             String announcePayload = "{";
-            announcePayload += "\"mac\":\"" + mac + "\",";
+            announcePayload += "\"mac\":\"" + deviceMac + "\",";
             announcePayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
             announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
             announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";
@@ -550,9 +838,16 @@ void connectMQTT() {
             }
             
             // Subscrever tópico de configuração
-            String cfgTopic = "devices/" + macTopic + "/config";
+            String cfgTopic = "devices/" + deviceMacTopic + "/config";
             mqttClient.subscribe(cfgTopic.c_str());
             Serial.println("📥 Inscrito no tópico: " + cfgTopic);
+
+            // Subscrever tópico de comandos
+            String cmdTopic = "devices/" + deviceMacTopic + "/command";
+            mqttClient.subscribe(cmdTopic.c_str());
+            Serial.println("📥 Inscrito no tópico: " + cmdTopic);
+
+            publishLogBacklog();
         } else {
             Serial.print(" Falha, rc=");
             Serial.println(mqttClient.state());
@@ -628,9 +923,8 @@ void readAndSendTemperature() {
 void sendHeartbeat() {
     if (!mqttClient.connected()) return;
 
-    String mac = WiFi.macAddress();
     String payload = "{";
-    payload += "\"mac\":\"" + mac + "\",";
+    payload += "\"mac\":\"" + deviceMac + "\",";
     payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     payload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
     payload += "\"uptime\":" + String(millis() / 1000) + ",";
@@ -684,15 +978,16 @@ bool isAuthenticated() {
 // Função para atualização OTA por URL
 void performOTAUpload(String url) {
   Serial.println("Iniciando OTA por URL: " + url);
-  
-  if (url.startsWith("https://")) {
-    Serial.println("Erro: URLs HTTPS não são suportadas. Use HTTP.");
-    return;
-  }
-  
-  HTTPClient http;
-  
-  http.begin(url);
+
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+
+    if (url.startsWith("https://")) {
+        secureClient.setInsecure();
+        http.begin(secureClient, url);
+    } else {
+        http.begin(url);
+    }
   int httpCode = http.GET();
   
   if (httpCode == HTTP_CODE_OK) {
@@ -961,13 +1256,25 @@ void setupWebServer()
     html += R"=====(
         </div>
     </div>
-    <script>setTimeout(() => location.reload(), 30000);</script>
+    <script>
+        setTimeout(() => location.reload(), 30000);
+    </script>
 </body>
 </html>
     )=====";
     
     server.send(200, "text/html", html);
 });
+
+    server.on("/logs", HTTP_GET, []() {
+        if (!isAuthenticated()) return;
+
+        unsigned long sinceSeq = 0;
+        if (server.hasArg("since")) {
+            sinceSeq = strtoul(server.arg("since").c_str(), nullptr, 10);
+        }
+        sendLogSnapshot(sinceSeq);
+    });
 
 server.on("/wifi", HTTP_GET, []() {
     if (!isAuthenticated()) return;
@@ -3594,10 +3901,9 @@ server.on("/admin", HTTP_GET, []() {
     }
     
     if (mqttClient.connected()) {
-      String mac = WiFi.macAddress();
       String announceTopic = "devices/announce";
       String announcePayload = "{";
-      announcePayload += "\"mac\":\"" + mac + "\",";
+    announcePayload += "\"mac\":\"" + deviceMac + "\",";
       announcePayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
       announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
       announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";

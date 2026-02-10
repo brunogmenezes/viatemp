@@ -562,11 +562,28 @@ mqttClient.on('connect', () => {
   mqttClient.subscribe('devices/announce', { qos: 0 });
   mqttClient.subscribe('devices/heartbeat', { qos: 0 });
   mqttClient.subscribe('esp32/temperature', { qos: 0 });
+  mqttClient.subscribe('devices/+/log', { qos: 0 });
 });
 
 mqttClient.on('message', (topic, payload) => {
   try {
     const msg = JSON.parse(payload.toString());
+    const logMatch = topic.match(/^devices\/([a-fA-F0-9]+)\/log$/);
+    if (logMatch) {
+      const key = logMatch[1].toLowerCase();
+      const device = devices[key];
+      const line = typeof msg.msg === 'string' ? msg.msg : '';
+      if (line.length) {
+        io.emit('device_log', {
+          mac: device && device.mac ? device.mac : null,
+          macKey: key,
+          seq: typeof msg.seq === 'number' ? msg.seq : null,
+          ts: typeof msg.ts === 'number' ? msg.ts : null,
+          msg: line
+        });
+      }
+      return;
+    }
     if (topic === 'devices/announce') {
       const mac = msg.mac;
       if (!mac) return;

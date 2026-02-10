@@ -34,6 +34,7 @@
             <a href="/locations.html" class="icon-btn" title="Localidades">📍</a>
             <a href="/firmware.html" class="icon-btn" title="Firmware">⬆️</a>
             <a href="/zabbix.html" class="icon-btn" title="Zabbix">📈</a>
+            <button id="log-open" class="icon-btn" title="Log">📜</button>
             <div class="user-menu" id="user-menu">
               <button class="user-trigger" id="user-trigger" type="button">
                 <span class="user-avatar" id="user-avatar">U</span>
@@ -155,6 +156,21 @@
         <div class="modal-actions">
           <button id="profile-close-btn" class="btn btn-ghost">Fechar</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Log Modal -->
+    <div id="log-modal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-panel log-panel">
+        <button id="log-close" class="modal-close">✕</button>
+        <h2>Log em tempo real</h2>
+        <div class="log-toolbar">
+          <select id="log-device" class="log-select"></select>
+          <input id="log-filter" class="log-filter" type="text" placeholder="Filtrar log...">
+          <button id="log-clear" class="btn btn-ghost" type="button">Limpar</button>
+        </div>
+        <pre id="log-output" class="log-output"></pre>
       </div>
     </div>
 
