@@ -219,7 +219,14 @@ function createDeviceElement(d) {
   if (chipTemp) {
     const temp = typeof d.temperature === 'number' ? d.temperature :
       (typeof d.temperature === 'string' ? parseFloat(d.temperature) : null);
-    chipTemp.textContent = Number.isFinite(temp) ? `Temp ${temp.toFixed(1)}°C` : 'Temp —';
+    const sensorOk = typeof d.sensorOk === 'boolean' ? d.sensorOk : null;
+    if (Number.isFinite(temp)) {
+      chipTemp.textContent = `Temp ${temp.toFixed(1)}°C`;
+    } else if (sensorOk === false) {
+      chipTemp.textContent = 'Sensor desconectado';
+    } else {
+      chipTemp.textContent = 'Temp —';
+    }
   }
   const chipIp = el.querySelector('.chip-ip');
   chipIp.textContent = d.ip ? `IP ${d.ip}` : 'IP desconhecido';
@@ -759,7 +766,10 @@ if (toggleSidebar) toggleSidebar.addEventListener('click', () => document.queryS
 let currentUser = null;
 
 function updateUserUI(){
-  const name = currentUser && currentUser.username ? currentUser.username : '—';
+  let name = currentUser && currentUser.username ? currentUser.username : '—';
+  if (currentUser && typeof currentUser === 'object' && currentUser.full_name && typeof currentUser.full_name === 'string' && currentUser.full_name.trim() && currentUser.full_name !== name) {
+    name = currentUser.full_name;
+  }
   const nameEl = document.getElementById('user-name');
   if (nameEl) nameEl.textContent = name;
   const avatarEl = document.getElementById('user-avatar');

@@ -525,7 +525,7 @@ body {
   font-size: 14px;
   line-height: 1.4;
 }
-.modal-close { position: absolute; right: 12px; top: 10px; border: 0; background: transparent; font-size: 18px; cursor: pointer; }
+.modal-close { position: absolute; right: 12px; top: 10px; border: 0; background: transparent; font-size: 18px; cursor: pointer; z-index: 3; }
 .modal-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 .modal-actions { gap: 8px; }
 
@@ -567,12 +567,16 @@ body {
 }
 
 .log-panel {
-  width: min(920px, 95vw);
+  width: min(600px, 98vw);
   max-height: 80vh;
   background: #0f172a;
   color: #e2e8f0;
   display: flex;
   flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding-bottom: 18px;
 }
 
 .log-panel h2 {
@@ -581,9 +585,22 @@ body {
 
 .log-toolbar {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
   margin-bottom: 12px;
+  z-index: 2;
+  position: relative;
+  flex-wrap: wrap;
+  padding-right: 0;
+}
+.log-toolbar .btn {
+  min-width: 60px;
+  padding: 6px 12px;
+  font-size: 14px;
+  white-space: nowrap;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .log-select,
@@ -607,6 +624,7 @@ body {
   font-size: 12px;
   flex: 1;
   white-space: pre-wrap;
+  margin-bottom: 0;
 }
 
 /* Utility Cards and Fields */
