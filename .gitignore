@@ -4,3 +4,6 @@
 # Keep example files tracked
 !.env.example
 !**/.env.example
+
+# Runtime device state (local/producao)
+server/devices.json
