@@ -35,7 +35,9 @@ const FIRMWARE_BASE_URL = process.env.FIRMWARE_BASE_URL || '';
 const ZABBIX_ITEM_KEYS = {
   uptime: 'viatemp.uptime',
   version: 'viatemp.version',
-  temperature: 'viatemp.temperature'
+  temperature: 'viatemp.temperature',
+  door: 'viatemp.door',
+  doorStatus: 'viatemp.door_status'
 };
 
 const ZABBIX_CONFIG_FILE = path.join(__dirname, 'zabbix.json');
@@ -379,6 +381,8 @@ async function pushZabbixValues(device, values) {
   if (!isZabbixEnabled() || !device || !device.zabbix) return;
   const entries = [];
   const clock = Math.floor(Date.now() / 1000);
+  const doorValue = values.doorOpen === true ? 1 : (values.doorOpen === false ? 0 : undefined);
+  const doorStatusValue = values.doorConnected === true ? 1 : (values.doorConnected === false ? 0 : undefined);
   const useSender = zabbixHistoryPushUnsupported || !device.zabbix.items;
   if (useSender) {
     const senderEntries = [];
@@ -386,6 +390,8 @@ async function pushZabbixValues(device, values) {
     if (values.uptime !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.uptime, value: Number(values.uptime), clock });
     if (values.version !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.version, value: String(values.version), clock });
     if (values.temperature !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.temperature, value: Number(values.temperature), clock });
+    if (doorValue !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.door, value: doorValue, clock });
+    if (doorStatusValue !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.doorStatus, value: doorStatusValue, clock });
     if (senderEntries.length) await zabbixSenderRequest(senderEntries);
     return;
   }
@@ -398,6 +404,12 @@ async function pushZabbixValues(device, values) {
   }
   if (values.temperature !== undefined && device.zabbix.items.temperature) {
     entries.push({ itemid: device.zabbix.items.temperature, value: Number(values.temperature), clock });
+  }
+  if (doorValue !== undefined && device.zabbix.items.door) {
+    entries.push({ itemid: device.zabbix.items.door, value: doorValue, clock });
+  }
+  if (doorStatusValue !== undefined && device.zabbix.items.doorStatus) {
+    entries.push({ itemid: device.zabbix.items.doorStatus, value: doorStatusValue, clock });
   }
   if (!entries.length) return;
 
@@ -415,6 +427,8 @@ async function pushZabbixValues(device, values) {
       if (values.uptime !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.uptime, value: Number(values.uptime), clock });
       if (values.version !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.version, value: String(values.version), clock });
       if (values.temperature !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.temperature, value: Number(values.temperature), clock });
+      if (doorValue !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.door, value: doorValue, clock });
+      if (doorStatusValue !== undefined) senderEntries.push({ host, key: ZABBIX_ITEM_KEYS.doorStatus, value: doorStatusValue, clock });
       if (senderEntries.length) await zabbixSenderRequest(senderEntries);
       return;
     }
@@ -568,6 +582,16 @@ mqttClient.on('connect', () => {
 mqttClient.on('message', (topic, payload) => {
   try {
     const msg = JSON.parse(payload.toString());
+    const parseBoolLike = (value) => {
+      if (typeof value === 'boolean') return value;
+      if (typeof value === 'number') return value === 1;
+      if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true' || normalized === '1') return true;
+        if (normalized === 'false' || normalized === '0') return false;
+      }
+      return null;
+    };
     const logMatch = topic.match(/^devices\/([a-fA-F0-9]+)\/log$/);
     if (logMatch) {
       const key = logMatch[1].toLowerCase();
@@ -592,6 +616,10 @@ mqttClient.on('message', (topic, payload) => {
       devices[key].mac = mac;
       devices[key].ip = msg.ip || devices[key].ip;
       devices[key].version = msg.version || devices[key].version;
+      const announceDoorConnected = parseBoolLike(msg.door_connected);
+      const announceDoorOpen = parseBoolLike(msg.door_open);
+      if (announceDoorConnected !== null) devices[key].doorConnected = announceDoorConnected;
+      if (announceDoorOpen !== null) devices[key].doorOpen = announceDoorOpen;
       devices[key].lastSeen = Date.now();
       devices[key].adopted = devices[key].adopted || false;
       scheduleSaveDevices();
@@ -610,13 +638,19 @@ mqttClient.on('message', (topic, payload) => {
       devices[key].uptime = typeof msg.uptime === 'number' ? msg.uptime : devices[key].uptime;
       devices[key].rssi = typeof msg.rssi === 'number' ? msg.rssi : devices[key].rssi;
       devices[key].heap = typeof msg.heap === 'number' ? msg.heap : devices[key].heap;
+      const heartbeatDoorConnected = parseBoolLike(msg.door_connected);
+      const heartbeatDoorOpen = parseBoolLike(msg.door_open);
+      if (heartbeatDoorConnected !== null) devices[key].doorConnected = heartbeatDoorConnected;
+      if (heartbeatDoorOpen !== null) devices[key].doorOpen = heartbeatDoorOpen;
       devices[key].lastSeen = Date.now();
       devices[key].adopted = devices[key].adopted || false;
       scheduleSaveDevices();
       io.emit('devices_updated', getDeviceList());
       queueZabbixUpdate(devices[key], {
         uptime: devices[key].uptime,
-        version: devices[key].version
+        version: devices[key].version,
+        doorOpen: devices[key].doorOpen,
+        doorConnected: devices[key].doorConnected
       });
     }
     if (topic === 'esp32/temperature') {
@@ -632,6 +666,12 @@ mqttClient.on('message', (topic, payload) => {
       devices[key].uptime = typeof msg.uptime === 'number' ? msg.uptime : devices[key].uptime;
       devices[key].rssi = typeof msg.rssi === 'number' ? msg.rssi : devices[key].rssi;
       devices[key].heap = typeof msg.heap === 'number' ? msg.heap : devices[key].heap;
+      if (typeof msg.sensor_ok === 'boolean') devices[key].sensorOk = msg.sensor_ok;
+      if (typeof msg.sensor_ok === 'number') devices[key].sensorOk = msg.sensor_ok === 1;
+      const tempDoorConnected = parseBoolLike(msg.door_connected);
+      const tempDoorOpen = parseBoolLike(msg.door_open);
+      if (tempDoorConnected !== null) devices[key].doorConnected = tempDoorConnected;
+      if (tempDoorOpen !== null) devices[key].doorOpen = tempDoorOpen;
       const temp = typeof msg.temperature === 'number' ? msg.temperature :
         (typeof msg.temperature === 'string' ? parseFloat(msg.temperature) : null);
       if (Number.isFinite(temp)) devices[key].temperature = temp;
@@ -642,7 +682,9 @@ mqttClient.on('message', (topic, payload) => {
       queueZabbixUpdate(devices[key], {
         temperature: devices[key].temperature,
         uptime: devices[key].uptime,
-        version: devices[key].version
+        version: devices[key].version,
+        doorOpen: devices[key].doorOpen,
+        doorConnected: devices[key].doorConnected
       });
     }
   } catch (e) {
@@ -804,7 +846,9 @@ app.post('/api/devices/:mac/zabbix/sync', verifyTokenMiddleware, async (req, res
     await pushZabbixValues(device, {
       uptime: device.uptime,
       version: device.version,
-      temperature: device.temperature
+      temperature: device.temperature,
+      doorOpen: device.doorOpen,
+      doorConnected: device.doorConnected
     });
     res.json({ ok: true, zabbix: device.zabbix || null });
   } catch (e) {

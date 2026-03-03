@@ -435,6 +435,24 @@ body {
   border-color: #bfdbfe;
 }
 
+.chip-door-open {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
+.chip-door-closed {
+  background: #ecfdf3;
+  color: #047857;
+  border-color: #bbf7d0;
+}
+
+.chip-door-disconnected {
+  background: #fff7ed;
+  color: #c2410c;
+  border-color: #fed7aa;
+}
+
 .device-card .name {
   font-weight: 700;
   color: var(--text-main);

@@ -18,6 +18,8 @@ void publishLogBacklog();
 String buildLogPayload(unsigned long seq, const String &line);
 String escapeJsonString(const String &input);
 void sendLogSnapshot(unsigned long sinceSeq);
+void printCurrentConfig();
+void performFactoryReset();
 
 class LogSerialWrapper : public Print {
 public:
@@ -51,11 +53,16 @@ LogSerialWrapper LogSerial(::Serial);
 #define Serial LogSerial
 
 // Versão do firmware
-#define FIRMWARE_VERSION "3.0.4"
+#define FIRMWARE_VERSION "3.0.7"
 
 // Definições para DS18B20
 #define ONE_WIRE_BUS 4
 #define TEMPERATURE_PRECISION 12
+
+// Definições para sensor de porta (reed switch)
+#define DOOR_SENSOR_PIN 14
+#define DOOR_DEBOUNCE_MS 150
+#define DOOR_CLOSED_PIN_STATE HIGH
 
 // Intervalo de leitura de temperatura em milissegundos
 #define TEMP_READ_INTERVAL 300000  // 5 minutos
@@ -110,6 +117,9 @@ PubSubClient mqttClient(wifiClient);
 WebAuthConfig webAuthConfig;
 SensorConfig sensorConfig;
 
+// Controle de envio da versão via MQTT
+unsigned long lastVersionSent = 0;
+const unsigned long intervalVersionSend = 24UL * 60UL * 60UL * 1000UL; // 24 horas em ms
 
 // Configurações
 WiFiConfig wifiConfig;
@@ -146,6 +156,10 @@ bool otaInProgress = false;
 // Variáveis do sensor
 DeviceAddress tempSensor;
 bool sensorFound = false;
+volatile bool doorInterruptTriggered = false;
+unsigned long lastDoorReadMs = 0;
+int lastDoorPinState = HIGH;
+bool doorSensorConnected = false;
 
 // Declaração antecipada das funções
 void performOTAUpload(String url);
@@ -161,6 +175,10 @@ void sendHeartbeat();
 bool isAuthenticated();
 void setupWebServer();
 void handleFactoryResetButton();
+void setupDoorSensor();
+void handleDoorSensor();
+String doorStateText();
+bool isDoorOpen();
 
 void setup() {
   Serial.begin(115200);
@@ -190,6 +208,7 @@ void setup() {
   
   // Inicializar sensor DS18B20
   setupDS18B20();
+    setupDoorSensor();
   
   // Carregar configurações
   loadConfig();
@@ -255,46 +274,94 @@ void setupDS18B20() {
   }
 }
 
+void IRAM_ATTR onDoorSensorInterrupt() {
+    doorInterruptTriggered = true;
+}
+
+void setupDoorSensor() {
+    pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
+    lastDoorPinState = digitalRead(DOOR_SENSOR_PIN);
+    doorSensorConnected = true;
+    attachInterrupt(digitalPinToInterrupt(DOOR_SENSOR_PIN), onDoorSensorInterrupt, CHANGE);
+
+    Serial.print("Sensor de porta inicializado no GPIO ");
+    Serial.println(DOOR_SENSOR_PIN);
+    Serial.println("Com INPUT_PULLUP, HIGH indica porta fechada.");
+}
+
+void handleDoorSensor() {
+    if (!doorInterruptTriggered) {
+        return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastDoorReadMs < DOOR_DEBOUNCE_MS) {
+        return;
+    }
+
+    int currentState = digitalRead(DOOR_SENSOR_PIN);
+    if (currentState != lastDoorPinState) {
+        lastDoorPinState = currentState;
+        doorSensorConnected = true;
+
+        Serial.print("Sensor de porta alterado: ");
+        Serial.println(doorStateText());
+    }
+
+    lastDoorReadMs = now;
+    doorInterruptTriggered = false;
+}
+
+String doorStateText() {
+    bool isOpen = isDoorOpen();
+    return isOpen ? "Aberta" : "Fechada";
+}
+
+bool isDoorOpen() {
+    return lastDoorPinState != DOOR_CLOSED_PIN_STATE;
+}
+
 void loop() {
     handleFactoryResetButton();
-  server.handleClient();
-  
-  if (!otaInProgress && !isAPMode) {
-    // Verificar reconexão WiFi
-    static unsigned long lastWiFiCheck = 0;
-    if (millis() - lastWiFiCheck > 30000) { // Verifica a cada 30 segundos
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("⚠️ WiFi desconectado! Tentando reconectar...");
-        WiFi.disconnect();
-        WiFi.begin(wifiConfig.ssid, wifiConfig.password);
-        
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-          delay(500);
-          Serial.print(".");
-          attempts++;
+    handleDoorSensor();
+    server.handleClient();
+    
+    if (!otaInProgress && !isAPMode) {
+        // Verificar reconexão WiFi
+        static unsigned long lastWiFiCheck = 0;
+        if (millis() - lastWiFiCheck > 30000) { // Verifica a cada 30 segundos
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("⚠️ WiFi desconectado! Tentando reconectar...");
+                WiFi.disconnect();
+                WiFi.begin(wifiConfig.ssid, wifiConfig.password);
+                
+                int attempts = 0;
+                while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+                    delay(500);
+                    Serial.print(".");
+                    attempts++;
+                }
+                
+                if (WiFi.status() == WL_CONNECTED) {
+                    Serial.println("\n✅ WiFi reconectado! IP: " + WiFi.localIP().toString());
+                } else {
+                    Serial.println("\n❌ Falha na reconexão WiFi");
+                }
+            }
+            lastWiFiCheck = millis();
         }
         
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("\n✅ WiFi reconectado! IP: " + WiFi.localIP().toString());
-        } else {
-          Serial.println("\n❌ Falha na reconexão WiFi");
+        // Verificar reconexão MQTT
+        if (!mqttClient.connected()) {
+            static unsigned long lastMQTTAttempt = 0;
+            if (millis() - lastMQTTAttempt > 5000) { // Tenta reconectar a cada 5 segundos
+                connectMQTT();
+                lastMQTTAttempt = millis();
+            }
         }
-      }
-      lastWiFiCheck = millis();
-    }
-    
-    // Verificar reconexão MQTT
-    if (!mqttClient.connected()) {
-      static unsigned long lastMQTTAttempt = 0;
-      if (millis() - lastMQTTAttempt > 5000) { // Tenta reconectar a cada 5 segundos
-        connectMQTT();
-        lastMQTTAttempt = millis();
-      }
-    }
-    
-    mqttClient.loop();
-    handleLogPublishQueue();
+        
+        mqttClient.loop();
+        handleLogPublishQueue();
 
         if (mqttClient.connected()) {
             unsigned long now = millis();
@@ -302,7 +369,13 @@ void loop() {
                 sendHeartbeat();
                 lastHeartbeat = now;
             }
+            // Envio da versão via MQTT a cada 24 horas
+            if (now - lastVersionSent >= intervalVersionSend || lastVersionSent == 0) {
+                mqttClient.publish("viatemp/version", FIRMWARE_VERSION);
+                lastVersionSent = now;
+            }
         }
+    }
     
     // Leitura e envio de temperatura
     static unsigned long lastTempRead = 0;
@@ -311,12 +384,12 @@ void loop() {
       readAndSendTemperature();
       lastTempRead = millis();
     }
-  }
   
-  if (shouldReboot) {
-    delay(1000);
-    ESP.restart();
-  }
+  
+    if (shouldReboot) {
+        delay(1000);
+        ESP.restart();
+    }
 }
 
 void handleFactoryResetButton() {
@@ -819,6 +892,8 @@ void connectMQTT() {
             announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
             announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";
             announcePayload += "\"location\":\"" + String(sensorConfig.location) + "\",";
+            announcePayload += "\"door_connected\":" + String(doorSensorConnected ? "true" : "false") + ",";
+            announcePayload += "\"door_open\":" + String(lastDoorPinState == HIGH ? "true" : "false") + ",";
             announcePayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
             announcePayload += "\"heap\":" + String(esp_get_free_heap_size()) + ",";
             announcePayload += "\"uptime\":" + String(millis() / 1000);
@@ -889,29 +964,30 @@ void readAndSendTemperature() {
   float temperature = readTemperature();
   
   if (!isnan(temperature)) {
-    // Publicar via MQTT
     connectMQTT();
-    
-    // Obter informações adicionais
     unsigned long uptime = millis() / 1000;
     int rssi = WiFi.RSSI();
-    
-    String payload = "{\"temperature\":" + String(temperature, 2) + 
-                     ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
-                     ",\"sensor\":\"" + String(sensorConfig.sensorName) + "\"" +
-                     ",\"location\":\"" + String(sensorConfig.location) + "\"" +
-                     ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
-                     ",\"uptime\":" + String(uptime) +
-                     ",\"rssi\":" + String(rssi) +
-                     ",\"heap\":" + String(esp_get_free_heap_size()) + "}";
-    
+    String payload = "{";
+    payload += "\"temperature\":" + String(temperature, 2);
+    payload += ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"";
+    payload += ",\"sensor\":\"" + String(sensorConfig.sensorName) + "\"";
+    payload += ",\"location\":\"" + String(sensorConfig.location) + "\"";
+    payload += ",\"door_connected\":" + String(doorSensorConnected ? "true" : "false");
+    payload += ",\"door_open\":" + String(isDoorOpen() ? "true" : "false");
+    payload += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    payload += ",\"uptime\":" + String(uptime);
+    payload += ",\"rssi\":" + String(rssi);
+    payload += ",\"heap\":" + String(esp_get_free_heap_size());
+    payload += "}";
     if (mqttClient.connected()) {
-      bool published = mqttClient.publish(mqttConfig.topic, payload.c_str());
-      if (published) {
-        Serial.println("✅ Dados enviados: " + payload);
-      } else {
-        Serial.println("❌ Falha ao publicar MQTT");
-      }
+      // Publish to configured topic
+      mqttClient.publish(mqttConfig.topic, payload.c_str());
+      // Also publish to esp32/temperature with mac
+      String tempPayload = payload;
+      int insertPos = tempPayload.indexOf('{') + 1;
+      tempPayload = tempPayload.substring(0, insertPos) + "\"mac\":\"" + deviceMac + "\"," + tempPayload.substring(insertPos);
+      mqttClient.publish("esp32/temperature", tempPayload.c_str());
+      Serial.println("✅ Dados enviados: " + tempPayload);
     } else {
       Serial.println("⚠️ MQTT desconectado, dados não enviados");
     }
@@ -928,6 +1004,8 @@ void sendHeartbeat() {
     payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     payload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
     payload += "\"uptime\":" + String(millis() / 1000) + ",";
+    payload += "\"door_connected\":" + String(doorSensorConnected ? "true" : "false") + ",";
+    payload += "\"door_open\":" + String(isDoorOpen() ? "true" : "false") + ",";
     payload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     payload += "\"heap\":" + String(esp_get_free_heap_size());
     payload += "}";
@@ -1239,6 +1317,15 @@ void setupWebServer()
         html += "<div class='value'>" + String(temp, 1) + "°C</div>";
         html += "<div style='text-align: center; color: #6b7280;'>Atualizado agora</div></div>";
 
+        html += "<div class='card'><h2>🚪 Sensor de Porta</h2>";
+        if (doorSensorConnected) {
+            html += "<span class='status-badge status-online'>🟢 Sensor Identificado</span>";
+        } else {
+            html += "<span class='status-badge status-offline'>🟠 Conexão não confirmada</span>";
+        }
+        html += "<div class='value' style='font-size:2.2em;'>" + doorStateText() + "</div>";
+        html += "<div style='text-align: center; color: #6b7280;'>Estado atual da porta</div></div>";
+
         html += "<div class='card'><h2>🔍 Dados do Sensor</h2>";
         html += "<span class='status-badge status-online'>🟢 Sensor Conectado</span>";
         html += "<div class='info-grid'>";
@@ -1251,6 +1338,15 @@ void setupWebServer()
         html += "<div style='font-size: 4em; margin-bottom: 20px;'>⚠️</div>";
         html += "<p style='color: #dc2626; font-weight: 600;'>Sensor DS18B20 não detectado</p>";
         html += "</div></div>";
+
+        html += "<div class='card'><h2>🚪 Sensor de Porta</h2>";
+        if (doorSensorConnected) {
+            html += "<span class='status-badge status-online'>🟢 Sensor Identificado</span>";
+        } else {
+            html += "<span class='status-badge status-offline'>🟠 Conexão não confirmada</span>";
+        }
+        html += "<div class='value' style='font-size:2.2em;'>" + doorStateText() + "</div>";
+        html += "<div style='text-align: center; color: #6b7280;'>Estado atual da porta</div></div>";
     }
 
     html += R"=====(
@@ -2384,7 +2480,7 @@ server.on("/logout", []() {
     </script>
 </body>
 </html>
-)=====";
+    )=====";
   
   server.send(200, "text/html", html);
   Serial.println("✅ Página de logout exibida");
@@ -3220,6 +3316,12 @@ server.on("/sensor", HTTP_GET, []() {
         .restart-icon {
             font-size: 4em;
             margin-bottom: 20px;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
         }
 
         .countdown {
@@ -3330,26 +3432,35 @@ server.on("/sensor", HTTP_GET, []() {
             100% { transform: scale(1); }
         }
         h1 {
-            color: #ef4444;
+            color: #dc2626;
             margin-bottom: 20px;
         }
-        .loading-bar {
+        .progress-container {
             width: 100%;
-            height: 8px;
             background: #e5e7eb;
-            border-radius: 4px;
+            border-radius: 10px;
             margin: 30px 0;
             overflow: hidden;
         }
-        .loading-progress {
+        .progress-bar {
             width: 0%;
-            height: 100%;
-            background: linear-gradient(90deg, #ef4444, #dc2626);
-            border-radius: 4px;
-            animation: loading 30s linear forwards;
+            height: 20px;
+            background: linear-gradient(90deg, #dc2626, #b91c1c);
+            border-radius: 10px;
+            animation: progress 5s linear forwards;
         }
-        @keyframes loading {
+        @keyframes progress {
             to { width: 100%; }
+        }
+        .status-list {
+            text-align: left;
+            margin: 20px 0;
+        }
+        .status-item {
+            margin: 10px 0;
+            padding: 8px;
+            border-left: 3px solid #10b981;
+            background: #f0f9ff;
         }
     </style>
 </head>
@@ -3360,11 +3471,20 @@ server.on("/sensor", HTTP_GET, []() {
         <p>O ESP32 está sendo reiniciado. Aguarde aproximadamente 30 segundos.</p>
         <p>Em seguida, recarregue a página ou acesse novamente o IP do dispositivo.</p>
         
-        <div class="loading-bar">
-            <div class="loading-progress"></div>
+        <div class="progress-container">
+            <div class="progress-bar"></div>
+        </div>
+
+        <div class="status-list">
+            <div class="status-item">✅ Limpando configurações da EEPROM</div>
+            <div class="status-item">✅ Restaurando credenciais web padrão</div>
+            <div class="status-item">✅ Resetando configurações WiFi</div>
+            <div class="status-item">✅ Configurações MQTT padrão</div>
+            <div class="status-item">✅ Nome do sensor padrão</div>
         </div>
         
-        <p><strong>Não desconecte a energia durante este processo!</strong></p>
+        <p><strong>O sistema reiniciará automaticamente em modo AP.</strong></p>
+        <p>Conecte-se ao WiFi <strong>ESP32-Temperature</strong> para reconfigurar.</p>
     </div>
     
     <script>
@@ -3892,49 +4012,37 @@ server.on("/admin", HTTP_GET, []() {
   // Rota para reenviar anúncio ao servidor (readoção)
   server.on("/announce", HTTP_GET, []() {
     if (!isAuthenticated()) return;
-    
     String json = "{";
-    
+    float temperature = readTemperature();
+    unsigned long uptime = millis() / 1000;
+    int rssi = WiFi.RSSI();
+    String payload = "{";
+    payload += "\"temperature\":" + String(temperature, 2);
+    payload += ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"";
+    payload += ",\"sensor\":\"" + String(sensorConfig.sensorName) + "\"";
+    payload += ",\"location\":\"" + String(sensorConfig.location) + "\"";
+    payload += ",\"door_connected\":" + String(doorSensorConnected ? "true" : "false");
+    payload += ",\"door_open\":" + String(lastDoorPinState == HIGH ? "true" : "false");
+    payload += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    payload += ",\"uptime\":" + String(uptime);
+    payload += ",\"rssi\":" + String(rssi);
+    payload += ",\"heap\":" + String(esp_get_free_heap_size());
+    payload += "}";
     if (!mqttClient.connected()) {
       connectMQTT();
       delay(500);
     }
-    
     if (mqttClient.connected()) {
-      String announceTopic = "devices/announce";
-      String announcePayload = "{";
-    announcePayload += "\"mac\":\"" + deviceMac + "\",";
-      announcePayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-      announcePayload += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
-      announcePayload += "\"sensor\":\"" + String(sensorConfig.sensorName) + "\",";
-      announcePayload += "\"location\":\"" + String(sensorConfig.location) + "\",";
-      announcePayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-      announcePayload += "\"heap\":" + String(esp_get_free_heap_size()) + ",";
-      announcePayload += "\"uptime\":" + String(millis() / 1000);
-      announcePayload += "}";
-      
-      Serial.println("📤 Anúncio manual - Tópico: " + announceTopic);
-      Serial.println("   Tamanho: " + String(announcePayload.length()) + " bytes");
-      Serial.println("   Payload: " + announcePayload);
-      
-      if (mqttClient.publish(announceTopic.c_str(), announcePayload.c_str(), true)) {
-        json += "\"status\":\"success\",";
-        json += "\"message\":\"Dispositivo anunciado com sucesso!\",";
-        json += "\"payload\":" + announcePayload;
-        json += "}";
-        Serial.println("✅ Dispositivo reanunciado manualmente ao servidor");
-      } else {
-        json += "\"status\":\"error\",";
-        json += "\"message\":\"Falha ao publicar no MQTT\"";
-        json += "}";
-        Serial.println("⚠️ Falha no anúncio manual - Estado: " + String(mqttClient.state()));
-      }
+      mqttClient.publish(mqttConfig.topic, payload.c_str());
+      String tempPayload = payload;
+      int insertPos = tempPayload.indexOf('{') + 1;
+      tempPayload = tempPayload.substring(0, insertPos) + "\"mac\":\"" + deviceMac + "\"," + tempPayload.substring(insertPos);
+      mqttClient.publish("esp32/temperature", tempPayload.c_str());
+      Serial.println("✅ Dados enviados: " + tempPayload);
     } else {
-      json += "\"status\":\"error\",";
-      json += "\"message\":\"MQTT não conectado\"";
-      json += "}";
+      Serial.println("⚠️ MQTT desconectado, dados não enviados");
     }
-    
+    json += "}";
     server.send(200, "application/json", json);
   });
 

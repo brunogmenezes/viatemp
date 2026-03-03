@@ -228,6 +228,25 @@ function createDeviceElement(d) {
       chipTemp.textContent = 'Temp —';
     }
   }
+  const chipDoor = el.querySelector('.chip-door');
+  if (chipDoor) {
+    const doorConnected = typeof d.doorConnected === 'boolean' ? d.doorConnected : null;
+    const doorOpen = typeof d.doorOpen === 'boolean' ? d.doorOpen : null;
+    chipDoor.classList.remove('chip-door-open', 'chip-door-closed', 'chip-door-disconnected');
+
+    if (doorConnected === false) {
+      chipDoor.textContent = '🚪✖ Sensor porta';
+      chipDoor.classList.add('chip-door-disconnected');
+    } else if (doorOpen === true) {
+      chipDoor.textContent = '🚪 Aberta';
+      chipDoor.classList.add('chip-door-open');
+    } else if (doorOpen === false) {
+      chipDoor.textContent = '🚪 Fechada';
+      chipDoor.classList.add('chip-door-closed');
+    } else {
+      chipDoor.textContent = '🚪 —';
+    }
+  }
   const chipIp = el.querySelector('.chip-ip');
   chipIp.textContent = d.ip ? `IP ${d.ip}` : 'IP desconhecido';
   const chipUptime = el.querySelector('.chip-uptime');
