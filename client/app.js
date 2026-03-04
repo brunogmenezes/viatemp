@@ -234,8 +234,8 @@ function createDeviceElement(d) {
     const doorOpen = typeof d.doorOpen === 'boolean' ? d.doorOpen : null;
     chipDoor.classList.remove('chip-door-open', 'chip-door-closed', 'chip-door-disconnected');
 
-    if (doorConnected === false) {
-      chipDoor.textContent = '🚪✖ Sensor porta';
+    if (doorConnected !== true) {
+      chipDoor.textContent = '🚪✖ Sensor porta off';
       chipDoor.classList.add('chip-door-disconnected');
     } else if (doorOpen === true) {
       chipDoor.textContent = '🚪 Aberta';
